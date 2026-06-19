@@ -300,6 +300,7 @@ async function getSoldPriceHistory(query) {
       maxPrice: Math.round(data.max_price) || null,
       totalSold: data.total_results || null,
       priceChangePct: parseFloat(priceChangePct.toFixed(2)),
+      monthsOfData: sortedMonths.length,
       source: 'rapidapi',
     };
   } catch (err) {
@@ -359,17 +360,33 @@ function getTodaysCategoryRotation() {
   return CATEGORY_SWEEPS.slice(start, start + CATEGORIES_PER_DAY);
 }
 
-function calcFlipScore(soldVolume, priceChangePct) {
-  const volumeScore = Math.min(soldVolume / 20, 1) * 60; // cluster size as proxy for demand
+function calcFlipScore(soldVolume, priceChangePct, monthsOfData) {
+  // Volume score: more granular curve, caps out at higher volume so
+  // moderate-volume items don't all hit the ceiling identically
+  const volumeScore = Math.min(soldVolume / 60, 1) * 55;
+
   let priceScore = 0;
-  if (priceChangePct >= -15 && priceChangePct < 0) {
-    priceScore = 40; // sweet spot — dipping but not crashing
-  } else if (priceChangePct >= 0 && priceChangePct <= 20) {
-    priceScore = 30 - priceChangePct; // rising — momentum
+  if (priceChangePct >= -15 && priceChangePct < -1) {
+    // Real sweet spot — dipping but not crashing
+    priceScore = 40;
+  } else if (priceChangePct >= -1 && priceChangePct <= 1) {
+    // Effectively flat. If we only have one month of sold data, this isn't
+    // a real "stable price" signal -- it just means we can't measure trend
+    // yet. Score it low/neutral rather than rewarding it like a real dip.
+    priceScore = monthsOfData && monthsOfData <= 1 ? 12 : 22;
+  } else if (priceChangePct > 1 && priceChangePct <= 20) {
+    priceScore = 32 - priceChangePct; // rising — momentum, but less than a dip
   } else if (priceChangePct < -15) {
     priceScore = 5; // crashing — risky
+  } else {
+    priceScore = 8; // rising fast (>20%) — likely already peaked, lower signal
   }
-  return Math.round(volumeScore + priceScore);
+
+  // Small deterministic variation based on volume so near-identical inputs
+  // don't all round to the exact same integer
+  const microVariance = (soldVolume % 7);
+
+  return Math.min(99, Math.round(volumeScore + priceScore + microVariance * 0.3));
 }
 
 let scanInProgress = false;
@@ -479,7 +496,7 @@ async function runTrendScan() {
 
       const soldVolume = soldData.totalSold;
       const priceChangePct = soldData.priceChangePct ?? 0;
-      const flipScore = calcFlipScore(soldVolume, priceChangePct);
+      const flipScore = calcFlipScore(soldVolume, priceChangePct, soldData.monthsOfData);
       const trend = priceChangePct >= -5 ? 'up' : 'down';
       const avgPrice = soldData.avgPrice || item.avgPrice;
 
