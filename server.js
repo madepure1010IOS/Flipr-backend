@@ -5,6 +5,8 @@ const crypto = require("crypto");
 
 const app = express();
 
+app.set('trust proxy', 1);
+
 // Rate limiters
 const generalLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
@@ -37,23 +39,31 @@ const SUPABASE_SECRET_KEY = process.env.SUPABASE_SECRET_KEY;
 
 // ─── Supabase helpers ────────────────────────────────────────────────────────
 
-async function supabaseQuery(path, method = 'GET', body = null) {
+async function supabaseQuery(path, method = 'GET', body = null, extraHeaders = {}) {
   const res = await fetch(`${SUPABASE_URL}/rest/v1${path}`, {
     method,
     headers: {
       'apikey': SUPABASE_SECRET_KEY,
       'Authorization': `Bearer ${SUPABASE_SECRET_KEY}`,
       'Content-Type': 'application/json',
-      'Prefer': method === 'POST' ? 'return=minimal' : '',
+      ...(method === 'POST' || method === 'PATCH' ? { 'Prefer': 'return=minimal' } : {}),
+      ...extraHeaders,
     },
     body: body ? JSON.stringify(body) : null,
   });
   if (!res.ok) {
     const err = await res.text();
-    throw new Error(`Supabase error: ${err}`);
+    throw new Error(`Supabase error (${res.status}): ${err}`);
   }
   if (method === 'GET') return res.json();
   return null;
+}
+
+// Upsert into daily_snapshots using Postgres ON CONFLICT via Prefer header
+async function upsertDailySnapshots(rows) {
+  await supabaseQuery('/daily_snapshots?on_conflict=name,snapshot_date', 'POST', rows, {
+    'Prefer': 'resolution=merge-duplicates,return=minimal',
+  });
 }
 
 // ─── eBay auth ───────────────────────────────────────────────────────────────
@@ -88,7 +98,7 @@ async function getEbayToken() {
   return null;
 }
 
-// ─── eBay search ─────────────────────────────────────────────────────────────
+// ─── eBay keyword search (used by /pricehistory, /search) ───────────────────
 
 async function searchEbay(query) {
   const token = await getEbayToken();
@@ -124,6 +134,71 @@ async function searchEbay(query) {
     console.error('eBay search error:', err);
     return null;
   }
+}
+
+// ─── eBay category sweep (used by discovery scanner) ─────────────────────────
+// Pulls real live listings from a whole category, sorted by newly listed,
+// so we discover actual item clusters instead of guessing product names.
+
+async function sweepEbayCategory(categoryId, limit = 100) {
+  const token = await getEbayToken();
+  if (!token) return [];
+  try {
+    const response = await fetch(
+      `https://api.ebay.com/buy/browse/v1/item_summary/search?category_ids=${categoryId}&limit=${limit}&sort=newlyListed&filter=buyingOptions:{FIXED_PRICE}`,
+      {
+        headers: {
+          'Authorization': `Bearer ${token}`,
+          'Content-Type': 'application/json',
+          'X-EBAY-C-MARKETPLACE-ID': 'EBAY_US',
+        },
+      }
+    );
+    const data = await response.json();
+    if (!data.itemSummaries) return [];
+    return data.itemSummaries
+      .filter(item => item.price && item.title)
+      .map(item => ({
+        title: item.title,
+        price: parseFloat(item.price.value),
+        image: item.image?.imageUrl || null,
+        condition: item.condition || null,
+      }));
+  } catch (err) {
+    console.error(`Category sweep error for ${categoryId}:`, err.message);
+    return [];
+  }
+}
+
+// Normalize a listing title down to a comparable "product key" so similar
+// listings cluster together (strips sizes, colors, condition words, etc.)
+const NOISE_WORDS = new Set([
+  'new', 'used', 'nwt', 'nib', 'mint', 'sealed', 'authentic', 'genuine',
+  'size', 'sz', 'us', 'mens', 'womens', 'unisex', 'fast', 'shipping',
+  'free', 'rare', 'vintage', 'lot', 'bundle', 'set', 'with', 'box',
+  'tags', 'brand', 'in', 'hand', 'fits', 'fit', 'wide', 'narrow',
+]);
+
+function clusterKey(title) {
+  return title
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, ' ')
+    .split(/\s+/)
+    .filter(w => w.length > 1 && !NOISE_WORDS.has(w) && isNaN(w))
+    .slice(0, 5) // keep first 5 meaningful words — brand + model usually lands here
+    .join(' ')
+    .trim();
+}
+
+function clusterListings(listings) {
+  const clusters = {};
+  for (const item of listings) {
+    const key = clusterKey(item.title);
+    if (!key || key.length < 4) continue;
+    if (!clusters[key]) clusters[key] = { items: [], displayName: item.title };
+    clusters[key].items.push(item);
+  }
+  return clusters;
 }
 
 // ─── RapidAPI sold history ────────────────────────────────────────────────────
@@ -171,7 +246,6 @@ async function getSoldPriceHistory(query) {
         price: Math.round(val.prices.reduce((a, b) => a + b, 0) / val.prices.length),
       }));
 
-    // Calculate price trend — compare oldest vs newest month
     const oldest = sortedMonths[0]?.price || 0;
     const newest = sortedMonths[sortedMonths.length - 1]?.price || 0;
     const priceChangePct = oldest > 0 ? ((newest - oldest) / oldest) * 100 : 0;
@@ -192,47 +266,29 @@ async function getSoldPriceHistory(query) {
   }
 }
 
-// ─── Trend scanner ────────────────────────────────────────────────────────────
-// Searches broad category seeds, scores each result by flip potential:
-// High sold volume + slight price dip = hidden opportunity
+// ─── Discovery scanner ─────────────────────────────────────────────────────────
+// Sweeps real eBay categories, clusters similar listings into product groups,
+// and scores each cluster by flip potential. No hardcoded product names.
 
-const SCAN_SEEDS = [
-  // Sneakers
-  "Nike Dunk Low", "Jordan 4 Retro", "New Balance 550", "Adidas Samba",
-  "Nike Air Max 90", "Jordan 1 Mid", "Asics Gel Kayano",
-  // Collectibles
-  "Pokemon Booster Box", "Pokemon Graded Card", "Magic The Gathering Box",
-  "Funko Pop Exclusive", "One Piece Card",
-  // Electronics
-  "Nintendo Switch OLED", "PS5 Controller", "AirPods Pro", "iPad Mini",
-  "GoPro Hero", "DJI Mini Drone",
-  // LEGO
-  "LEGO Technic", "LEGO Icons", "LEGO Creator", "LEGO Botanical",
-  // Streetwear
-  "Supreme Hoodie", "Bape Hoodie", "Palace Skateboarding", "Corteiz",
-  // Watches
-  "Casio G-Shock", "Seiko Prospex", "Tissot PRX",
-  // Sports Cards
-  "Rookie Card PSA", "Panini Prizm Box", "Topps Chrome Box",
-  // Vintage
-  "Vintage Band Tee", "Vintage Levi Jacket", "Vintage Nike",
+const CATEGORY_SWEEPS = [
+  { id: '15709', name: 'Sneakers' },
+  { id: '2536', name: 'Cards' },
+  { id: '1249', name: 'Electronics' },
+  { id: '1', name: 'Collectibles' },
+  { id: '220', name: 'LEGO' },
+  { id: '281', name: 'Watches' },
+  { id: '11450', name: 'Streetwear' },
 ];
 
 function calcFlipScore(soldVolume, priceChangePct) {
-  // High volume = good liquidity
-  // Slight price dip (-15% to 0%) = buy opportunity
-  // Rising price = momentum play
-  const volumeScore = Math.min(soldVolume / 500, 1) * 60; // max 60 pts
+  const volumeScore = Math.min(soldVolume / 20, 1) * 60; // cluster size as proxy for demand
   let priceScore = 0;
   if (priceChangePct >= -15 && priceChangePct < 0) {
-    // Sweet spot — dipping but not crashing
-    priceScore = 40;
+    priceScore = 40; // sweet spot — dipping but not crashing
   } else if (priceChangePct >= 0 && priceChangePct <= 20) {
-    // Rising — momentum
-    priceScore = 30 - priceChangePct;
+    priceScore = 30 - priceChangePct; // rising — momentum
   } else if (priceChangePct < -15) {
-    // Crashing — risky
-    priceScore = 5;
+    priceScore = 5; // crashing — risky
   }
   return Math.round(volumeScore + priceScore);
 }
@@ -248,54 +304,112 @@ async function runTrendScan() {
   }
 
   scanInProgress = true;
-  console.log('Starting trend scan...');
-  const results = [];
+  console.log('Starting category discovery scan...');
+  const discovered = [];
 
-  for (const seed of SCAN_SEEDS) {
+  for (const cat of CATEGORY_SWEEPS) {
     try {
-      const [ebayData, soldData] = await Promise.all([
-        searchEbay(seed),
-        getSoldPriceHistory(seed),
-      ]);
+      const listings = await sweepEbayCategory(cat.id, 100);
+      if (listings.length === 0) continue;
 
-      if (!ebayData && !soldData) continue;
+      const clusters = clusterListings(listings);
 
-      const avgPrice = soldData?.avgPrice || ebayData?.avgPrice || 0;
-      const soldVolume = soldData?.totalSold || ebayData?.totalSold || 0;
-      const priceChangePct = soldData?.priceChangePct || 0;
+      for (const [key, cluster] of Object.entries(clusters)) {
+        // Only consider clusters with enough listings to mean something
+        if (cluster.items.length < 3) continue;
+
+        const prices = cluster.items.map(i => i.price);
+        const avgPrice = Math.round(prices.reduce((a, b) => a + b, 0) / prices.length);
+        const image = cluster.items.find(i => i.image)?.image || null;
+
+        // Use the cleanest/shortest title in the cluster as display name
+        const displayName = cluster.items
+          .map(i => i.title)
+          .sort((a, b) => a.length - b.length)[0];
+
+        discovered.push({
+          name: displayName,
+          clusterKey: key,
+          category: cat.name,
+          avgPrice,
+          clusterSize: cluster.items.length,
+          image,
+        });
+      }
+
+      await new Promise(r => setTimeout(r, 400));
+    } catch (err) {
+      console.error(`Sweep error for ${cat.name}:`, err.message);
+    }
+  }
+
+  console.log(`Found ${discovered.length} candidate clusters. Scoring top ones with RapidAPI...`);
+
+  // Sort by cluster size (proxy for demand) and only deep-score the top candidates
+  // to avoid hammering RapidAPI with hundreds of calls
+  const topCandidates = discovered
+    .sort((a, b) => b.clusterSize - a.clusterSize)
+    .slice(0, 40);
+
+  const results = [];
+  for (const item of topCandidates) {
+    try {
+      const soldData = await getSoldPriceHistory(item.name);
+      const soldVolume = soldData?.totalSold || item.clusterSize * 10; // fallback estimate
+      const priceChangePct = soldData?.priceChangePct ?? 0;
       const flipScore = calcFlipScore(soldVolume, priceChangePct);
       const trend = priceChangePct >= -5 ? 'up' : 'down';
+      const avgPrice = soldData?.avgPrice || item.avgPrice;
 
       results.push({
-        name: seed,
-        category: getCategoryForItem(seed),
+        name: item.name,
+        category: item.category,
         avg_price: avgPrice,
         sold_volume: soldVolume,
         price_change_pct: priceChangePct,
         flip_score: flipScore,
-        image: ebayData?.image || null,
+        image: item.image,
         trend,
-        last_scanned_at: new Date().toISOString(),
+        scanned_at: new Date().toISOString(),
       });
 
-      // Small delay to avoid hammering APIs
       await new Promise(r => setTimeout(r, 300));
     } catch (err) {
-      console.error(`Scan error for ${seed}:`, err.message);
+      console.error(`Scoring error for ${item.name}:`, err.message);
     }
   }
 
   if (results.length === 0) {
+    console.log('No results to save.');
     scanInProgress = false;
     return;
   }
 
   try {
-    // Clear old results and insert fresh ones
-    await supabaseQuery('/discovered_trends?id=neq.00000000-0000-0000-0000-000000000000', 'DELETE');
-    await supabaseQuery('/discovered_trends', 'POST', results);
+    // Write raw scan to scan_history (append, never overwrite)
+    await supabaseQuery('/scan_history', 'POST', results);
+
+    // Upsert today's best score per item into daily_snapshots
+    const today = new Date().toISOString().split('T')[0];
+    const snapshotRows = results.map(r => ({
+      name: r.name,
+      category: r.category,
+      avg_price: r.avg_price,
+      sold_volume: r.sold_volume,
+      price_change_pct: r.price_change_pct,
+      flip_score: r.flip_score,
+      image: r.image,
+      trend: r.trend,
+      snapshot_date: today,
+    }));
+    await upsertDailySnapshots(snapshotRows);
+
+    // Prune scan_history older than 30 days
+    const cutoff = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
+    await supabaseQuery(`/scan_history?scanned_at=lt.${cutoff}`, 'DELETE');
+
     lastScanTime = new Date();
-    console.log(`Trend scan complete. ${results.length} items saved.`);
+    console.log(`Trend scan complete. ${results.length} items saved (scan_history + daily_snapshots).`);
   } catch (err) {
     console.error('Failed to save trends to Supabase:', err.message);
   }
@@ -336,15 +450,27 @@ function getMockHistory(base) {
 
 // ─── Routes ───────────────────────────────────────────────────────────────────
 
-// Discover endpoint — returns ranked flip opportunities from Supabase
+// Discover endpoint — returns ranked flip opportunities from latest scan
 app.get("/discover", async (req, res) => {
   try {
     const data = await supabaseQuery(
-      '/discovered_trends?order=flip_score.desc&limit=20'
+      '/scan_history?order=scanned_at.desc,flip_score.desc&limit=300'
     );
 
     if (data && data.length > 0) {
-      const formatted = data.map(item => ({
+      // De-dupe by name, keeping only the most recent scan per item
+      const seen = new Set();
+      const deduped = [];
+      for (const item of data) {
+        if (seen.has(item.name)) continue;
+        seen.add(item.name);
+        deduped.push(item);
+      }
+      const ranked = deduped
+        .sort((a, b) => b.flip_score - a.flip_score)
+        .slice(0, 30);
+
+      const formatted = ranked.map(item => ({
         name: item.name,
         price: `$${item.avg_price}`,
         change: `${item.price_change_pct >= 0 ? '+' : ''}${item.price_change_pct}%`,
@@ -355,10 +481,9 @@ app.get("/discover", async (req, res) => {
         flipScore: item.flip_score,
         source: 'discovered',
       }));
-      return res.json({ results: formatted, lastScanned: data[0]?.last_scanned_at });
+      return res.json({ results: formatted, lastScanned: data[0]?.scanned_at });
     }
 
-    // No data yet — trigger a scan and return mock while it runs
     if (!scanInProgress) runTrendScan();
     return res.json({ results: [], lastScanned: null, scanning: true });
   } catch (err) {
@@ -367,7 +492,23 @@ app.get("/discover", async (req, res) => {
   }
 });
 
-// Manually trigger a rescan (call from admin or cron)
+// Long-term history for a specific item, pulled from daily_snapshots
+app.get("/history", async (req, res) => {
+  const { name } = req.query;
+  if (!name) return res.status(400).json({ error: "Name required" });
+  try {
+    const encoded = encodeURIComponent(name);
+    const data = await supabaseQuery(
+      `/daily_snapshots?name=eq.${encoded}&order=snapshot_date.asc&limit=365`
+    );
+    res.json({ history: data || [] });
+  } catch (err) {
+    console.error('History error:', err.message);
+    res.json({ history: [] });
+  }
+});
+
+// Manually trigger a rescan
 app.post("/scan", async (req, res) => {
   if (scanInProgress) {
     return res.json({ message: 'Scan already in progress' });
@@ -556,7 +697,6 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Flipr backend running on http://localhost:${PORT}`);
 
-  // Run initial scan on startup, then every 6 hours
   setTimeout(() => runTrendScan(), 5000);
   setInterval(() => runTrendScan(), 6 * 60 * 60 * 1000);
 });
