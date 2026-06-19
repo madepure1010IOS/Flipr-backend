@@ -1,12 +1,31 @@
 const express = require("express");
 const cors = require("cors");
+const rateLimit = require("express-rate-limit");
 
 const app = express();
+
+// Rate limiters
+const generalLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 100,
+  message: { error: "Too many requests, please try again later." },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+const searchLimiter = rateLimit({
+  windowMs: 1 * 60 * 1000, // 1 minute
+  max: 20,
+  message: { error: "Search rate limit exceeded, please slow down." },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
 app.use(cors());
 app.use(express.json());
+app.use(generalLimiter);
 
 // Mock data structured exactly like real eBay data will be
-// When your eBay key arrives, we just swap this function out
 const getMockListings = (query) => {
   const base = Math.floor(Math.random() * 200) + 100;
   return {
@@ -55,7 +74,7 @@ app.get("/trending", (req, res) => {
 });
 
 // Search endpoint
-app.get("/search", (req, res) => {
+app.get("/search", searchLimiter, (req, res) => {
   const { q } = req.query;
   if (!q) return res.status(400).json({ error: "Query required" });
 
