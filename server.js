@@ -459,11 +459,19 @@ async function runTrendScan() {
   const results = [];
   for (const item of topCandidates) {
     try {
-      const soldData = await getSoldPriceHistory(item.searchQuery);
+      let soldData = await getSoldPriceHistory(item.searchQuery);
 
-      // If RapidAPI found no real sold history for this item, we have no
-      // honest signal to score it on -- skip it rather than faking a score
-      // from clusterSize alone. Showing fabricated scores defeats the point.
+      // If the specific cluster query found nothing, retry with a broader
+      // 2-word query (likely brand + general category) before giving up.
+      // Niche items often need a wider net to find any sold comps at all.
+      if (!soldData || !soldData.totalSold) {
+        const broaderQuery = item.searchQuery.split(' ').slice(0, 2).join(' ');
+        if (broaderQuery && broaderQuery !== item.searchQuery) {
+          await new Promise(r => setTimeout(r, 300));
+          soldData = await getSoldPriceHistory(broaderQuery);
+        }
+      }
+
       if (!soldData || !soldData.totalSold) {
         await new Promise(r => setTimeout(r, 300));
         continue;
