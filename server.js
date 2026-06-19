@@ -187,17 +187,36 @@ const NOISE_WORDS = new Set([
   'size', 'sz', 'us', 'mens', 'womens', 'unisex', 'fast', 'shipping',
   'free', 'rare', 'vintage', 'lot', 'bundle', 'set', 'with', 'box',
   'tags', 'brand', 'in', 'hand', 'fits', 'fit', 'wide', 'narrow',
+  'and', 'the', 'for', 'a', 'an', 'of', 'to', 'pair', 'pairs',
+  'condition', 'great', 'good', 'excellent', 'never', 'worn', 'deadstock',
+  'ds', 'og', 'pair', 'edition', 'color', 'colorway',
+]);
+
+// Common color words also get stripped — they vary listing to listing for
+// the "same" cluster intent (e.g. different colorways of the same model
+// often still represent the same flip opportunity at the product level)
+const COLOR_WORDS = new Set([
+  'black', 'white', 'red', 'blue', 'green', 'yellow', 'grey', 'gray',
+  'pink', 'purple', 'orange', 'brown', 'tan', 'beige', 'navy', 'gold',
+  'silver', 'multicolor', 'multi',
 ]);
 
 function clusterKey(title) {
-  return title
+  const words = title
     .toLowerCase()
     .replace(/[^a-z0-9\s]/g, ' ')
     .split(/\s+/)
-    .filter(w => w.length > 1 && !NOISE_WORDS.has(w) && isNaN(Number(w)))
-    .slice(0, 5) // keep first 5 meaningful words -- brand + model usually lands here
-    .join(' ')
-    .trim();
+    .filter(w =>
+      w.length > 1 &&
+      !NOISE_WORDS.has(w) &&
+      !COLOR_WORDS.has(w) &&
+      isNaN(Number(w)) // drop pure numbers (sizes, years as standalone tokens)
+    );
+
+  // Keep only the first 4 significant words (brand + model usually lands
+  // here), then sort alphabetically so word order differences between
+  // listings of the same product still produce the same key
+  return words.slice(0, 4).sort().join(' ').trim();
 }
 
 function clusterListings(listings) {
@@ -323,11 +342,12 @@ async function runTrendScan() {
       if (listings.length === 0) continue;
 
       const clusters = clusterListings(listings);
-      console.log(`[cluster] ${cat.name}: ${listings.length} listings -> ${Object.keys(clusters).length} raw clusters`);
+      const clusterSizes = Object.values(clusters).map(c => c.items.length).sort((a, b) => b - a);
+      console.log(`[cluster] ${cat.name}: ${listings.length} listings -> ${Object.keys(clusters).length} raw clusters, top sizes: ${clusterSizes.slice(0, 10).join(',')}`);
 
       for (const [key, cluster] of Object.entries(clusters)) {
         // Only consider clusters with enough listings to mean something
-        if (cluster.items.length < 3) continue;
+        if (cluster.items.length < 2) continue;
 
         const prices = cluster.items.map(i => i.price);
         const avgPrice = Math.round(prices.reduce((a, b) => a + b, 0) / prices.length);
