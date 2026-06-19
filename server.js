@@ -140,12 +140,13 @@ async function searchEbay(query) {
 // Pulls real live listings from a whole category, sorted by newly listed,
 // so we discover actual item clusters instead of guessing product names.
 
-async function sweepEbayCategory(categoryId, limit = 100) {
+async function sweepEbayCategory(categoryId, keyword, limit = 100) {
   const token = await getEbayToken();
   if (!token) return [];
   try {
+    const encodedKeyword = encodeURIComponent(keyword);
     const response = await fetch(
-      `https://api.ebay.com/buy/browse/v1/item_summary/search?category_ids=${categoryId}&limit=${limit}&sort=newlyListed&filter=buyingOptions:{FIXED_PRICE}`,
+      `https://api.ebay.com/buy/browse/v1/item_summary/search?q=${encodedKeyword}&category_ids=${categoryId}&limit=${limit}&sort=newlyListed&filter=buyingOptions:{FIXED_PRICE}`,
       {
         headers: {
           'Authorization': `Bearer ${token}`,
@@ -184,8 +185,8 @@ function clusterKey(title) {
     .toLowerCase()
     .replace(/[^a-z0-9\s]/g, ' ')
     .split(/\s+/)
-    .filter(w => w.length > 1 && !NOISE_WORDS.has(w) && isNaN(w))
-    .slice(0, 5) // keep first 5 meaningful words — brand + model usually lands here
+    .filter(w => w.length > 1 && !NOISE_WORDS.has(w) && isNaN(Number(w)))
+    .slice(0, 5) // keep first 5 meaningful words -- brand + model usually lands here
     .join(' ')
     .trim();
 }
@@ -271,13 +272,13 @@ async function getSoldPriceHistory(query) {
 // and scores each cluster by flip potential. No hardcoded product names.
 
 const CATEGORY_SWEEPS = [
-  { id: '15709', name: 'Sneakers' },
-  { id: '2536', name: 'Cards' },
-  { id: '1249', name: 'Electronics' },
-  { id: '1', name: 'Collectibles' },
-  { id: '220', name: 'LEGO' },
-  { id: '281', name: 'Watches' },
-  { id: '11450', name: 'Streetwear' },
+  { id: '15709', name: 'Sneakers', keyword: 'shoes' },
+  { id: '2536', name: 'Cards', keyword: 'trading cards' },
+  { id: '1249', name: 'Electronics', keyword: 'electronics' },
+  { id: '1', name: 'Collectibles', keyword: 'collectible' },
+  { id: '220', name: 'LEGO', keyword: 'lego' },
+  { id: '281', name: 'Watches', keyword: 'watch' },
+  { id: '11450', name: 'Streetwear', keyword: 'streetwear' },
 ];
 
 function calcFlipScore(soldVolume, priceChangePct) {
@@ -309,7 +310,7 @@ async function runTrendScan() {
 
   for (const cat of CATEGORY_SWEEPS) {
     try {
-      const listings = await sweepEbayCategory(cat.id, 100);
+      const listings = await sweepEbayCategory(cat.id, cat.keyword, 100);
       if (listings.length === 0) continue;
 
       const clusters = clusterListings(listings);
@@ -389,19 +390,27 @@ async function runTrendScan() {
     // Write raw scan to scan_history (append, never overwrite)
     await supabaseQuery('/scan_history', 'POST', results);
 
-    // Upsert today's best score per item into daily_snapshots
+    // Upsert today's best score per item into daily_snapshots.
+    // De-dupe by name first -- Postgres upsert errors if the same
+    // conflict key appears twice in one batch.
     const today = new Date().toISOString().split('T')[0];
-    const snapshotRows = results.map(r => ({
-      name: r.name,
-      category: r.category,
-      avg_price: r.avg_price,
-      sold_volume: r.sold_volume,
-      price_change_pct: r.price_change_pct,
-      flip_score: r.flip_score,
-      image: r.image,
-      trend: r.trend,
-      snapshot_date: today,
-    }));
+    const seenNames = new Set();
+    const snapshotRows = [];
+    for (const r of results) {
+      if (seenNames.has(r.name)) continue;
+      seenNames.add(r.name);
+      snapshotRows.push({
+        name: r.name,
+        category: r.category,
+        avg_price: r.avg_price,
+        sold_volume: r.sold_volume,
+        price_change_pct: r.price_change_pct,
+        flip_score: r.flip_score,
+        image: r.image,
+        trend: r.trend,
+        snapshot_date: today,
+      });
+    }
     await upsertDailySnapshots(snapshotRows);
 
     // Prune scan_history older than 30 days
@@ -484,8 +493,8 @@ app.get("/discover", async (req, res) => {
       return res.json({ results: formatted, lastScanned: data[0]?.scanned_at });
     }
 
-    if (!scanInProgress) runTrendScan();
-    return res.json({ results: [], lastScanned: null, scanning: true });
+    if (!scanInProgress && !lastScanTime) runTrendScan();
+    return res.json({ results: [], lastScanned: null, scanning: scanInProgress });
   } catch (err) {
     console.error('Discover error:', err.message);
     return res.json({ results: [], lastScanned: null, error: true });
