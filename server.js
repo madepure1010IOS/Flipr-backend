@@ -142,21 +142,30 @@ async function searchEbay(query) {
 
 async function sweepEbayCategory(categoryId, keyword, limit = 100) {
   const token = await getEbayToken();
-  if (!token) return [];
+  if (!token) {
+    console.log(`[sweep] No eBay token available for category ${categoryId}`);
+    return [];
+  }
   try {
     const encodedKeyword = encodeURIComponent(keyword);
-    const response = await fetch(
-      `https://api.ebay.com/buy/browse/v1/item_summary/search?q=${encodedKeyword}&category_ids=${categoryId}&limit=${limit}&sort=newlyListed&filter=buyingOptions:{FIXED_PRICE}`,
-      {
-        headers: {
-          'Authorization': `Bearer ${token}`,
-          'Content-Type': 'application/json',
-          'X-EBAY-C-MARKETPLACE-ID': 'EBAY_US',
-        },
-      }
-    );
+    const url = `https://api.ebay.com/buy/browse/v1/item_summary/search?q=${encodedKeyword}&category_ids=${categoryId}&limit=${limit}&sort=newlyListed&filter=buyingOptions:{FIXED_PRICE}`;
+    const response = await fetch(url, {
+      headers: {
+        'Authorization': `Bearer ${token}`,
+        'Content-Type': 'application/json',
+        'X-EBAY-C-MARKETPLACE-ID': 'EBAY_US',
+      },
+    });
     const data = await response.json();
-    if (!data.itemSummaries) return [];
+    if (!response.ok) {
+      console.log(`[sweep] eBay error for category ${categoryId} (status ${response.status}):`, JSON.stringify(data).slice(0, 500));
+      return [];
+    }
+    if (!data.itemSummaries) {
+      console.log(`[sweep] No itemSummaries for category ${categoryId}. Response keys:`, Object.keys(data));
+      return [];
+    }
+    console.log(`[sweep] Category ${categoryId} (${keyword}): ${data.itemSummaries.length} items returned`);
     return data.itemSummaries
       .filter(item => item.price && item.title)
       .map(item => ({
@@ -166,7 +175,7 @@ async function sweepEbayCategory(categoryId, keyword, limit = 100) {
         condition: item.condition || null,
       }));
   } catch (err) {
-    console.error(`Category sweep error for ${categoryId}:`, err.message);
+    console.error(`[sweep] Exception for category ${categoryId}:`, err.message);
     return [];
   }
 }
@@ -314,6 +323,7 @@ async function runTrendScan() {
       if (listings.length === 0) continue;
 
       const clusters = clusterListings(listings);
+      console.log(`[cluster] ${cat.name}: ${listings.length} listings -> ${Object.keys(clusters).length} raw clusters`);
 
       for (const [key, cluster] of Object.entries(clusters)) {
         // Only consider clusters with enough listings to mean something
