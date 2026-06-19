@@ -37,12 +37,10 @@ async function getEbayToken() {
   if (ebayToken && ebayTokenExpiry && Date.now() < ebayTokenExpiry) {
     return ebayToken;
   }
-
   if (!EBAY_CLIENT_SECRET) {
     console.log('No eBay secret, using mock data');
     return null;
   }
-
   try {
     const credentials = Buffer.from(`${EBAY_CLIENT_ID}:${EBAY_CLIENT_SECRET}`).toString('base64');
     const response = await fetch('https://api.ebay.com/identity/v1/oauth2/token', {
@@ -53,7 +51,6 @@ async function getEbayToken() {
       },
       body: 'grant_type=client_credentials&scope=https://api.ebay.com/oauth/api_scope',
     });
-
     const data = await response.json();
     if (data.access_token) {
       ebayToken = data.access_token;
@@ -69,7 +66,6 @@ async function getEbayToken() {
 async function searchEbay(query) {
   const token = await getEbayToken();
   if (!token) return null;
-
   try {
     const encoded = encodeURIComponent(query);
     const response = await fetch(
@@ -82,29 +78,84 @@ async function searchEbay(query) {
         },
       }
     );
-
     const data = await response.json();
     if (!data.itemSummaries || data.itemSummaries.length === 0) return null;
-
     const prices = data.itemSummaries
       .filter(item => item.price)
       .map(item => parseFloat(item.price.value));
-
     if (prices.length === 0) return null;
-
     const avgPrice = Math.round(prices.reduce((a, b) => a + b, 0) / prices.length);
-    const minPrice = Math.min(...prices);
-    const maxPrice = Math.max(...prices);
-
     return {
       avgPrice,
-      minPrice: Math.round(minPrice),
-      maxPrice: Math.round(maxPrice),
+      minPrice: Math.round(Math.min(...prices)),
+      maxPrice: Math.round(Math.max(...prices)),
       totalSold: data.total || prices.length,
-      items: data.itemSummaries.slice(0, 3),
     };
   } catch (err) {
     console.error('eBay search error:', err);
+    return null;
+  }
+}
+
+// RapidAPI sold price history
+async function getSoldPriceHistory(query) {
+  const rapidApiKey = process.env.RAPIDAPI_KEY;
+  if (!rapidApiKey) return null;
+
+  try {
+    const response = await fetch(
+      'https://ebay-average-selling-price.p.rapidapi.com/findCompletedItems',
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-rapidapi-host': 'ebay-average-selling-price.p.rapidapi.com',
+          'x-rapidapi-key': rapidApiKey,
+        },
+        body: JSON.stringify({
+          keywords: query,
+          max_search_results: '60',
+          remove_outliers: 'true',
+        }),
+      }
+    );
+
+    const data = await response.json();
+    if (!data || !data.products || data.products.length === 0) return null;
+
+    // Group sold items by month to build price history
+    const byMonth = {};
+    data.products.forEach(item => {
+      if (!item.sold_date || !item.sold_price) return;
+      const date = new Date(item.sold_date);
+      if (isNaN(date.getTime())) return;
+      const key = `${date.getFullYear()}-${String(date.getMonth()).padStart(2, '0')}`;
+      if (!byMonth[key]) byMonth[key] = { prices: [], date };
+      byMonth[key].prices.push(parseFloat(item.sold_price));
+    });
+
+    if (Object.keys(byMonth).length === 0) return null;
+
+    const monthNames = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+
+    const sortedMonths = Object.entries(byMonth)
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([key, val], i, arr) => ({
+        date: i === arr.length - 1 ? 'Now' : monthNames[val.date.getMonth()],
+        price: Math.round(val.prices.reduce((a, b) => a + b, 0) / val.prices.length),
+      }));
+
+    return {
+      history6M: sortedMonths.slice(-6),
+      history1Y: sortedMonths.slice(-12),
+      avgPrice: Math.round(data.average_price) || null,
+      minPrice: Math.round(data.min_price) || null,
+      maxPrice: Math.round(data.max_price) || null,
+      totalSold: data.total_results || null,
+      source: 'rapidapi',
+    };
+  } catch (err) {
+    console.error('RapidAPI error:', err);
     return null;
   }
 }
@@ -126,9 +177,13 @@ const getMockListings = (query) => {
 function getMockHistory(base) {
   const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Now'];
   return {
-    history: months.map((date, i) => ({
+    history6M: months.map((date, i) => ({
       date,
       price: Math.floor(base * (0.78 + i * 0.04)),
+    })),
+    history1Y: months.map((date, i) => ({
+      date,
+      price: Math.floor(base * (0.65 + i * 0.07)),
     })),
     avgPrice: base,
     source: 'mock',
@@ -151,17 +206,13 @@ app.get("/trending", async (req, res) => {
   const trending = await Promise.all(trendingNames.map(async (name) => {
     const ebayData = await searchEbay(name);
     const mock = getMockListings(name);
-
     const avgPrice = ebayData ? ebayData.avgPrice : mock.avgPrice;
     const totalSold = ebayData ? ebayData.totalSold : mock.totalSold;
-    const trend = mock.trend;
-    const changePercent = mock.changePercent;
-
     return {
       name,
       price: `$${avgPrice}`,
-      change: `${trend === "up" ? "+" : "-"}${changePercent}%`,
-      trend,
+      change: `${mock.trend === "up" ? "+" : "-"}${mock.changePercent}%`,
+      trend: mock.trend,
       volume: `${totalSold} listed`,
       category: getCategoryForItem(name),
       source: ebayData ? 'ebay' : 'mock',
@@ -178,35 +229,15 @@ app.get("/search", searchLimiter, async (req, res) => {
 
   const ebayData = await searchEbay(q);
   const mock = getMockListings(q);
-
   const avgPrice = ebayData ? ebayData.avgPrice : mock.avgPrice;
   const totalSold = ebayData ? ebayData.totalSold : mock.totalSold;
 
   res.json({
     source: ebayData ? 'ebay' : 'mock',
     results: [
-      {
-        name: q,
-        ...mock,
-        avgPrice,
-        totalSold,
-        category: getCategoryForItem(q),
-        price: `$${avgPrice}`,
-      },
-      {
-        name: `${q} (Used)`,
-        ...getMockListings(q),
-        avgPrice: Math.floor(avgPrice * 0.75),
-        category: getCategoryForItem(q),
-        price: `$${Math.floor(avgPrice * 0.75)}`,
-      },
-      {
-        name: `${q} (New/Sealed)`,
-        ...getMockListings(q),
-        avgPrice: Math.floor(avgPrice * 1.15),
-        category: getCategoryForItem(q),
-        price: `$${Math.floor(avgPrice * 1.15)}`,
-      },
+      { name: q, ...mock, avgPrice, totalSold, category: getCategoryForItem(q), price: `$${avgPrice}` },
+      { name: `${q} (Used)`, ...getMockListings(q), avgPrice: Math.floor(avgPrice * 0.75), category: getCategoryForItem(q), price: `$${Math.floor(avgPrice * 0.75)}` },
+      { name: `${q} (New/Sealed)`, ...getMockListings(q), avgPrice: Math.floor(avgPrice * 1.15), category: getCategoryForItem(q), price: `$${Math.floor(avgPrice * 1.15)}` },
     ],
   });
 });
@@ -215,15 +246,21 @@ app.get("/search", searchLimiter, async (req, res) => {
 app.get("/item", (req, res) => {
   const { name } = req.query;
   if (!name) return res.status(400).json({ error: "Name required" });
-  const data = getMockListings(name);
-  res.json(data);
+  res.json(getMockListings(name));
 });
 
-// Price history endpoint
+// Price history endpoint — uses RapidAPI real sold data
 app.get("/pricehistory", async (req, res) => {
   const { name } = req.query;
   if (!name) return res.status(400).json({ error: "Name required" });
 
+  // Try RapidAPI first — real sold price history
+  const soldData = await getSoldPriceHistory(name);
+  if (soldData && soldData.history6M.length > 0) {
+    return res.json(soldData);
+  }
+
+  // Fall back to eBay Browse API estimate
   const token = await getEbayToken();
   if (!token) {
     const base = Math.floor(Math.random() * 300) + 100;
@@ -233,7 +270,7 @@ app.get("/pricehistory", async (req, res) => {
   try {
     const encoded = encodeURIComponent(name);
     const response = await fetch(
-      `https://api.ebay.com/buy/browse/v1/item_summary/search?q=${encoded}&limit=50&filter=buyingOptions:{FIXED_PRICE}&sort=newlyListed`,
+      `https://api.ebay.com/buy/browse/v1/item_summary/search?q=${encoded}&limit=50&filter=buyingOptions:{FIXED_PRICE}`,
       {
         headers: {
           'Authorization': `Bearer ${token}`,
@@ -249,52 +286,27 @@ app.get("/pricehistory", async (req, res) => {
       return res.json(getMockHistory(base));
     }
 
-    const prices = data.itemSummaries
-      .filter(item => item.price)
-      .map(item => parseFloat(item.price.value));
-
-    if (prices.length === 0) {
-      const base = Math.floor(Math.random() * 300) + 100;
-      return res.json(getMockHistory(base));
-    }
-
+    const prices = data.itemSummaries.filter(i => i.price).map(i => parseFloat(i.price.value));
     const avg = Math.round(prices.reduce((a, b) => a + b, 0) / prices.length);
     const now = new Date();
     const monthNames = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
 
-    // Build 6 month history
-    const history = [];
+    const history6M = [];
     for (let i = 5; i >= 0; i--) {
       const date = new Date(now.getFullYear(), now.getMonth() - i, 1);
-      const monthName = monthNames[date.getMonth()];
       const factor = 0.82 + (0.18 * ((5 - i) / 5)) + (Math.random() * 0.06 - 0.03);
-      history.push({
-        date: i === 0 ? 'Now' : monthName,
-        price: Math.round(avg * factor),
-      });
+      history6M.push({ date: i === 0 ? 'Now' : monthNames[date.getMonth()], price: Math.round(avg * factor) });
     }
 
-    // Build 1Y history
     const history1Y = [];
     for (let i = 11; i >= 0; i--) {
       const date = new Date(now.getFullYear(), now.getMonth() - i, 1);
-      const monthName = monthNames[date.getMonth()];
       const factor = 0.65 + (0.35 * ((11 - i) / 11)) + (Math.random() * 0.06 - 0.03);
-      history1Y.push({
-        date: i === 0 ? 'Now' : monthName,
-        price: Math.round(avg * factor),
-      });
+      history1Y.push({ date: i === 0 ? 'Now' : monthNames[date.getMonth()], price: Math.round(avg * factor) });
     }
 
-    res.json({
-      history6M: history,
-      history1Y,
-      avgPrice: avg,
-      source: 'ebay',
-    });
-
+    res.json({ history6M, history1Y, avgPrice: avg, source: 'ebay' });
   } catch (err) {
-    console.error('Price history error:', err);
     const base = Math.floor(Math.random() * 300) + 100;
     res.json(getMockHistory(base));
   }
@@ -305,12 +317,7 @@ app.get('/ebay/account-deletion', (req, res) => {
   const challengeCode = req.query.challenge_code;
   const verificationToken = 'flipr-verify-token-2026-marketplace-deletion';
   const endpoint = 'https://flipr-backend-production-ac14.up.railway.app/ebay/account-deletion';
-
-  const hash = crypto
-    .createHash('sha256')
-    .update(challengeCode + verificationToken + endpoint)
-    .digest('hex');
-
+  const hash = crypto.createHash('sha256').update(challengeCode + verificationToken + endpoint).digest('hex');
   res.json({ challengeResponse: hash });
 });
 
