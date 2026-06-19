@@ -234,7 +234,10 @@ function clusterListings(listings) {
 
 async function getSoldPriceHistory(query) {
   const rapidApiKey = process.env.RAPIDAPI_KEY;
-  if (!rapidApiKey) return null;
+  if (!rapidApiKey) {
+    console.log('[rapidapi] No RAPIDAPI_KEY set');
+    return null;
+  }
   try {
     const response = await fetch(
       'https://ebay-average-selling-price.p.rapidapi.com/findCompletedItems',
@@ -252,8 +255,18 @@ async function getSoldPriceHistory(query) {
         }),
       }
     );
+
+    if (!response.ok) {
+      const errText = await response.text();
+      console.log(`[rapidapi] HTTP ${response.status} for "${query}": ${errText.slice(0, 300)}`);
+      return null;
+    }
+
     const data = await response.json();
-    if (!data || !data.products || data.products.length === 0) return null;
+    if (!data || !data.products || data.products.length === 0) {
+      console.log(`[rapidapi] No products for "${query}". Response:`, JSON.stringify(data).slice(0, 200));
+      return null;
+    }
 
     const byMonth = {};
     data.products.forEach(item => {
@@ -290,7 +303,7 @@ async function getSoldPriceHistory(query) {
       source: 'rapidapi',
     };
   } catch (err) {
-    console.error('RapidAPI error:', err);
+    console.error(`[rapidapi] Exception for "${query}":`, err.message);
     return null;
   }
 }
