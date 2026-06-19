@@ -315,12 +315,49 @@ async function getSoldPriceHistory(query) {
 const CATEGORY_SWEEPS = [
   { id: '15709', name: 'Sneakers', keyword: 'shoes' },
   { id: '2536', name: 'Cards', keyword: 'trading cards' },
-  { id: '1249', name: 'Electronics', keyword: 'electronics' },
+  { id: '1249', name: 'Video Games', keyword: 'video games' },
   { id: '1', name: 'Collectibles', keyword: 'collectible' },
-  { id: '220', name: 'LEGO', keyword: 'lego' },
+  { id: '220', name: 'Toys & Hobbies', keyword: 'toy' },
   { id: '281', name: 'Watches', keyword: 'watch' },
   { id: '11450', name: 'Streetwear', keyword: 'streetwear' },
+  { id: '293', name: 'Electronics', keyword: 'electronics' },
+  { id: '267', name: 'Books', keyword: 'book' },
+  { id: '619', name: 'Musical Instruments', keyword: 'guitar' },
+  { id: '11700', name: 'Home & Garden', keyword: 'home decor' },
+  { id: '888', name: 'Sporting Goods', keyword: 'sports equipment' },
+  { id: '64482', name: 'Sports Cards', keyword: 'sports memorabilia' },
+  { id: '870', name: 'Pottery & Glass', keyword: 'vintage glass' },
+  { id: '237', name: 'Dolls & Bears', keyword: 'collectible doll' },
+  { id: '11116', name: 'Coins', keyword: 'coin' },
+  { id: '260', name: 'Stamps', keyword: 'stamp' },
+  { id: '14339', name: 'Crafts', keyword: 'craft supplies' },
+  { id: '26395', name: 'Health & Beauty', keyword: 'skincare' },
+  { id: '1281', name: 'Pet Supplies', keyword: 'pet gear' },
+  { id: '625', name: 'Cameras', keyword: 'camera' },
+  { id: '15032', name: 'Cell Phones', keyword: 'smartphone' },
+  { id: '45100', name: 'Entertainment Memorabilia', keyword: 'movie memorabilia' },
+  { id: '12576', name: 'Business & Industrial', keyword: 'tools' },
+  { id: '11233', name: 'Music', keyword: 'vinyl record' },
+  { id: '11232', name: 'Movies & TV', keyword: 'dvd' },
+  { id: '11116', name: 'Paper Money', keyword: 'currency note' },
+  { id: '550', name: 'Art', keyword: 'art print' },
+  { id: '20081', name: 'Antiques', keyword: 'antique' },
+  { id: '11700', name: 'Garden', keyword: 'garden tool' },
 ];
+
+// Only deep-score this many categories per day, rotating through the full
+// list. Keeps RapidAPI usage flat (~5 categories x 8 items = ~40 calls/day)
+// no matter how many categories we sweep for clustering.
+const CATEGORIES_PER_DAY = 5;
+const CLUSTERS_PER_CATEGORY = 8;
+
+function getTodaysCategoryRotation() {
+  const dayIndex = Math.floor(Date.now() / (24 * 60 * 60 * 1000));
+  const totalSlots = Math.ceil(CATEGORY_SWEEPS.length / CATEGORIES_PER_DAY);
+  const slot = dayIndex % totalSlots;
+  const start = slot * CATEGORIES_PER_DAY;
+  return CATEGORY_SWEEPS.slice(start, start + CATEGORIES_PER_DAY);
+}
 
 function calcFlipScore(soldVolume, priceChangePct) {
   const volumeScore = Math.min(soldVolume / 20, 1) * 60; // cluster size as proxy for demand
@@ -347,6 +384,10 @@ async function runTrendScan() {
 
   scanInProgress = true;
   console.log('Starting category discovery scan...');
+  const todaysScoring = getTodaysCategoryRotation();
+  const todaysScoringNames = new Set(todaysScoring.map(c => c.name));
+  console.log(`Today's deep-scoring rotation: ${todaysScoring.map(c => c.name).join(', ')}`);
+
   const discovered = [];
 
   for (const cat of CATEGORY_SWEEPS) {
@@ -388,6 +429,7 @@ async function runTrendScan() {
           avgPrice,
           clusterSize: cluster.items.length,
           image,
+          eligibleForScoring: todaysScoringNames.has(cat.name),
         });
       }
 
@@ -397,13 +439,22 @@ async function runTrendScan() {
     }
   }
 
-  console.log(`Found ${discovered.length} candidate clusters. Scoring top ones with RapidAPI...`);
+  console.log(`Found ${discovered.length} candidate clusters across ${CATEGORY_SWEEPS.length} categories. Deep-scoring only today's rotation: ${todaysScoring.map(c => c.name).join(', ')}.`);
 
-  // Sort by cluster size (proxy for demand) and only deep-score the top candidates
-  // to avoid hammering RapidAPI with hundreds of calls
-  const topCandidates = discovered
-    .sort((a, b) => b.clusterSize - a.clusterSize)
-    .slice(0, 40);
+  // Only deep-score clusters from today's rotating category subset,
+  // taking the largest clusters per category up to CLUSTERS_PER_CATEGORY
+  const eligibleCandidates = discovered.filter(d => d.eligibleForScoring);
+  const byCategory = {};
+  for (const item of eligibleCandidates) {
+    if (!byCategory[item.category]) byCategory[item.category] = [];
+    byCategory[item.category].push(item);
+  }
+
+  const topCandidates = [];
+  for (const catName of Object.keys(byCategory)) {
+    const sorted = byCategory[catName].sort((a, b) => b.clusterSize - a.clusterSize);
+    topCandidates.push(...sorted.slice(0, CLUSTERS_PER_CATEGORY));
+  }
 
   const results = [];
   for (const item of topCandidates) {
@@ -523,15 +574,17 @@ function getMockHistory(base) {
 
 // ─── Routes ───────────────────────────────────────────────────────────────────
 
-// Discover endpoint — returns ranked flip opportunities from latest scan
+// Discover endpoint — returns ranked flip opportunities from the most
+// recent snapshot per item across the rotation (so categories not scored
+// today still show their last known score, not disappear)
 app.get("/discover", async (req, res) => {
   try {
     const data = await supabaseQuery(
-      '/scan_history?order=scanned_at.desc,flip_score.desc&limit=300'
+      '/daily_snapshots?order=snapshot_date.desc,flip_score.desc&limit=500'
     );
 
     if (data && data.length > 0) {
-      // De-dupe by name, keeping only the most recent scan per item
+      // De-dupe by name, keeping only the most recent snapshot per item
       const seen = new Set();
       const deduped = [];
       for (const item of data) {
@@ -541,7 +594,7 @@ app.get("/discover", async (req, res) => {
       }
       const ranked = deduped
         .sort((a, b) => b.flip_score - a.flip_score)
-        .slice(0, 30);
+        .slice(0, 50);
 
       const formatted = ranked.map(item => ({
         name: item.name,
@@ -554,7 +607,7 @@ app.get("/discover", async (req, res) => {
         flipScore: item.flip_score,
         source: 'discovered',
       }));
-      return res.json({ results: formatted, lastScanned: data[0]?.scanned_at });
+      return res.json({ results: formatted, lastScanned: data[0]?.snapshot_date });
     }
 
     if (!scanInProgress && !lastScanTime) runTrendScan();
@@ -771,5 +824,5 @@ app.listen(PORT, () => {
   console.log(`Flipr backend running on http://localhost:${PORT}`);
 
   setTimeout(() => runTrendScan(), 5000);
-  setInterval(() => runTrendScan(), 6 * 60 * 60 * 1000);
+  setInterval(() => runTrendScan(), 24 * 60 * 60 * 1000);
 });
