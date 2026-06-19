@@ -85,11 +85,13 @@ async function searchEbay(query) {
       .map(item => parseFloat(item.price.value));
     if (prices.length === 0) return null;
     const avgPrice = Math.round(prices.reduce((a, b) => a + b, 0) / prices.length);
+    const imageItem = data.itemSummaries.find(item => item.image?.imageUrl);
     return {
       avgPrice,
       minPrice: Math.round(Math.min(...prices)),
       maxPrice: Math.round(Math.max(...prices)),
       totalSold: data.total || prices.length,
+      image: imageItem?.image?.imageUrl || null,
     };
   } catch (err) {
     console.error('eBay search error:', err);
@@ -123,7 +125,6 @@ async function getSoldPriceHistory(query) {
     const data = await response.json();
     if (!data || !data.products || data.products.length === 0) return null;
 
-    // Group sold items by month to build price history
     const byMonth = {};
     data.products.forEach(item => {
       if (!item.sold_date || !item.sold_price) return;
@@ -215,6 +216,7 @@ app.get("/trending", async (req, res) => {
       trend: mock.trend,
       volume: `${totalSold} listed`,
       category: getCategoryForItem(name),
+      image: ebayData?.image || null,
       source: ebayData ? 'ebay' : 'mock',
     };
   }));
@@ -235,9 +237,31 @@ app.get("/search", searchLimiter, async (req, res) => {
   res.json({
     source: ebayData ? 'ebay' : 'mock',
     results: [
-      { name: q, ...mock, avgPrice, totalSold, category: getCategoryForItem(q), price: `$${avgPrice}` },
-      { name: `${q} (Used)`, ...getMockListings(q), avgPrice: Math.floor(avgPrice * 0.75), category: getCategoryForItem(q), price: `$${Math.floor(avgPrice * 0.75)}` },
-      { name: `${q} (New/Sealed)`, ...getMockListings(q), avgPrice: Math.floor(avgPrice * 1.15), category: getCategoryForItem(q), price: `$${Math.floor(avgPrice * 1.15)}` },
+      {
+        name: q,
+        ...mock,
+        avgPrice,
+        totalSold,
+        category: getCategoryForItem(q),
+        price: `$${avgPrice}`,
+        image: ebayData?.image || null,
+      },
+      {
+        name: `${q} (Used)`,
+        ...getMockListings(q),
+        avgPrice: Math.floor(avgPrice * 0.75),
+        category: getCategoryForItem(q),
+        price: `$${Math.floor(avgPrice * 0.75)}`,
+        image: ebayData?.image || null,
+      },
+      {
+        name: `${q} (New/Sealed)`,
+        ...getMockListings(q),
+        avgPrice: Math.floor(avgPrice * 1.15),
+        category: getCategoryForItem(q),
+        price: `$${Math.floor(avgPrice * 1.15)}`,
+        image: ebayData?.image || null,
+      },
     ],
   });
 });
@@ -254,13 +278,11 @@ app.get("/pricehistory", async (req, res) => {
   const { name } = req.query;
   if (!name) return res.status(400).json({ error: "Name required" });
 
-  // Try RapidAPI first — real sold price history
   const soldData = await getSoldPriceHistory(name);
   if (soldData && soldData.history6M.length > 0) {
     return res.json(soldData);
   }
 
-  // Fall back to eBay Browse API estimate
   const token = await getEbayToken();
   if (!token) {
     const base = Math.floor(Math.random() * 300) + 100;
