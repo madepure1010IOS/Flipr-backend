@@ -358,8 +358,18 @@ async function runTrendScan() {
           .map(i => i.title)
           .sort((a, b) => a.length - b.length)[0];
 
+        // Build a clean search query for RapidAPI from the cluster key itself
+        // (brand + model words, no seller fluff) -- much more likely to match
+        // real sold listings than the messy original eBay title
+        const searchQuery = key
+          .split(' ')
+          .filter(w => w.length > 2)
+          .slice(0, 4)
+          .join(' ');
+
         discovered.push({
           name: displayName,
+          searchQuery: searchQuery || displayName,
           clusterKey: key,
           category: cat.name,
           avgPrice,
@@ -385,12 +395,21 @@ async function runTrendScan() {
   const results = [];
   for (const item of topCandidates) {
     try {
-      const soldData = await getSoldPriceHistory(item.name);
-      const soldVolume = soldData?.totalSold || item.clusterSize * 10; // fallback estimate
-      const priceChangePct = soldData?.priceChangePct ?? 0;
+      const soldData = await getSoldPriceHistory(item.searchQuery);
+
+      // If RapidAPI found no real sold history for this item, we have no
+      // honest signal to score it on -- skip it rather than faking a score
+      // from clusterSize alone. Showing fabricated scores defeats the point.
+      if (!soldData || !soldData.totalSold) {
+        await new Promise(r => setTimeout(r, 300));
+        continue;
+      }
+
+      const soldVolume = soldData.totalSold;
+      const priceChangePct = soldData.priceChangePct ?? 0;
       const flipScore = calcFlipScore(soldVolume, priceChangePct);
       const trend = priceChangePct >= -5 ? 'up' : 'down';
-      const avgPrice = soldData?.avgPrice || item.avgPrice;
+      const avgPrice = soldData.avgPrice || item.avgPrice;
 
       results.push({
         name: item.name,
@@ -409,6 +428,8 @@ async function runTrendScan() {
       console.error(`Scoring error for ${item.name}:`, err.message);
     }
   }
+
+  console.log(`Scored ${results.length} of ${topCandidates.length} candidates with real sold data (rest skipped — no RapidAPI match).`);
 
   if (results.length === 0) {
     console.log('No results to save.');
