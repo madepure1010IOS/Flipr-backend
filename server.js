@@ -739,63 +739,62 @@ app.get("/item", (req, res) => {
 });
 
 // Price history endpoint
+// RULE: RapidAPI is NEVER called here or from any user-triggered request.
+// RapidAPI only runs inside the backend's own daily scan job.
+//
+// - If this item was found by the discovery scanner, serve its cached
+//   RapidAPI-sourced history + flip score straight from Supabase.
+// - If it's any other item (from general /search), build a price snapshot
+//   from live eBay Browse API data only -- current listings, no historical
+//   chart, no flip score, since that requires RapidAPI which we don't call here.
 app.get("/pricehistory", async (req, res) => {
   const { name } = req.query;
   if (!name) return res.status(400).json({ error: "Name required" });
 
-  const soldData = await getSoldPriceHistory(name);
-  if (soldData && soldData.history6M.length > 0) {
-    return res.json(soldData);
-  }
-
-  const token = await getEbayToken();
-  if (!token) {
-    const base = Math.floor(Math.random() * 300) + 100;
-    return res.json(getMockHistory(base));
-  }
-
+  // 1. Check Supabase cache first -- this is a discovered/scored item
   try {
     const encoded = encodeURIComponent(name);
-    const response = await fetch(
-      `https://api.ebay.com/buy/browse/v1/item_summary/search?q=${encoded}&limit=50&filter=buyingOptions:{FIXED_PRICE}`,
-      {
-        headers: {
-          'Authorization': `Bearer ${token}`,
-          'Content-Type': 'application/json',
-          'X-EBAY-C-MARKETPLACE-ID': 'EBAY_US',
-        },
-      }
+    const cached = await supabaseQuery(
+      `/daily_snapshots?name=eq.${encoded}&order=snapshot_date.desc&limit=1`
     );
-    const data = await response.json();
-    if (!data.itemSummaries || data.itemSummaries.length === 0) {
-      const base = Math.floor(Math.random() * 300) + 100;
-      return res.json(getMockHistory(base));
+    if (cached && cached.length > 0) {
+      const item = cached[0];
+      return res.json({
+        avgPrice: item.avg_price,
+        totalSold: item.sold_volume,
+        priceChangePct: item.price_change_pct,
+        flipScore: item.flip_score,
+        trend: item.trend,
+        scored: true,
+        source: 'cached',
+        lastUpdated: item.snapshot_date,
+      });
     }
-
-    const prices = data.itemSummaries.filter(i => i.price).map(i => parseFloat(i.price.value));
-    const avg = Math.round(prices.reduce((a, b) => a + b, 0) / prices.length);
-    const now = new Date();
-    const monthNames = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
-
-    const history6M = [];
-    for (let i = 5; i >= 0; i--) {
-      const date = new Date(now.getFullYear(), now.getMonth() - i, 1);
-      const factor = 0.82 + (0.18 * ((5 - i) / 5)) + (Math.random() * 0.06 - 0.03);
-      history6M.push({ date: i === 0 ? 'Now' : monthNames[date.getMonth()], price: Math.round(avg * factor) });
-    }
-
-    const history1Y = [];
-    for (let i = 11; i >= 0; i--) {
-      const date = new Date(now.getFullYear(), now.getMonth() - i, 1);
-      const factor = 0.65 + (0.35 * ((11 - i) / 11)) + (Math.random() * 0.06 - 0.03);
-      history1Y.push({ date: i === 0 ? 'Now' : monthNames[date.getMonth()], price: Math.round(avg * factor) });
-    }
-
-    res.json({ history6M, history1Y, avgPrice: avg, source: 'ebay' });
   } catch (err) {
-    const base = Math.floor(Math.random() * 300) + 100;
-    res.json(getMockHistory(base));
+    console.error('Cache lookup error:', err.message);
   }
+
+  // 2. Not a discovered item -- build a live snapshot from eBay only.
+  // No RapidAPI call, no flip score, no historical chart.
+  const ebayData = await searchEbay(name);
+  if (ebayData) {
+    return res.json({
+      avgPrice: ebayData.avgPrice,
+      minPrice: ebayData.minPrice,
+      maxPrice: ebayData.maxPrice,
+      totalSold: ebayData.totalSold,
+      scored: false,
+      source: 'ebay_live',
+    });
+  }
+
+  // 3. eBay also found nothing -- return an honest empty state, never mock data
+  return res.json({
+    avgPrice: null,
+    scored: false,
+    source: 'none',
+    message: 'No pricing data available for this item.',
+  });
 });
 
 // eBay Marketplace Account Deletion endpoint
