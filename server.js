@@ -850,12 +850,55 @@ function getCategoryForItem(name) {
   return "General";
 }
 
+// Checks Supabase for the most recent real scan timestamp. Used on every
+// boot so redeploys never burn RapidAPI calls unless a scan is genuinely
+// overdue -- this decouples "server restarted" from "time to scan again".
+async function getLastRealScanTime() {
+  if (!SUPABASE_URL || !SUPABASE_SECRET_KEY) return null;
+  try {
+    const data = await supabaseQuery(
+      '/scan_history?order=scanned_at.desc&limit=1'
+    );
+    if (data && data.length > 0) {
+      return new Date(data[0].scanned_at);
+    }
+  } catch (err) {
+    console.error('Could not check last scan time:', err.message);
+  }
+  return null;
+}
+
+async function scanIfOverdue() {
+  const lastReal = await getLastRealScanTime();
+  const SCAN_INTERVAL_MS = 24 * 60 * 60 * 1000;
+
+  if (!lastReal) {
+    console.log('No previous scan found in Supabase -- running first scan.');
+    runTrendScan();
+    return;
+  }
+
+  const msSinceLastScan = Date.now() - lastReal.getTime();
+  if (msSinceLastScan >= SCAN_INTERVAL_MS) {
+    console.log(`Last real scan was ${Math.round(msSinceLastScan / 3600000)}h ago -- running scan.`);
+    runTrendScan();
+  } else {
+    const hoursLeft = ((SCAN_INTERVAL_MS - msSinceLastScan) / 3600000).toFixed(1);
+    console.log(`Last real scan was only ${(msSinceLastScan / 3600000).toFixed(1)}h ago -- skipping (next scan in ~${hoursLeft}h). Redeploys are free.`);
+  }
+}
+
 // ─── Boot ─────────────────────────────────────────────────────────────────────
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Flipr backend running on http://localhost:${PORT}`);
 
-  setTimeout(() => runTrendScan(), 5000);
-  setInterval(() => runTrendScan(), 24 * 60 * 60 * 1000);
+  // Check Supabase before scanning -- redeploys during development no
+  // longer cost RapidAPI calls unless a scan is genuinely overdue.
+  setTimeout(() => scanIfOverdue(), 5000);
+
+  // Still check every 24h while the process stays alive, in case it runs
+  // continuously without a redeploy for multiple days.
+  setInterval(() => scanIfOverdue(), 24 * 60 * 60 * 1000);
 });
