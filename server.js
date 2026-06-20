@@ -228,6 +228,17 @@ function clusterListings(listings) {
   return clusters;
 }
 
+// A handful of condition strings signal the listing is basically junk
+// (broken, parts-only, etc). Those get excluded from price-bound math --
+// a $20 "for parts" listing isn't a real flip opportunity, it's noise
+// that would fake a wide spread.
+function isGoodCondition(conditionStr) {
+  if (!conditionStr) return true;
+  const c = conditionStr.toLowerCase();
+  const poorSignals = ['for parts', 'not working', 'damaged', 'as-is', 'as is', 'salvage'];
+  return !poorSignals.some(signal => c.includes(signal));
+}
+
 // ─── Discovery scanner ─────────────────────────────────────────────────────────
 // eBay-only -- no RapidAPI, no paid sold-history data. Sweeps real eBay
 // categories, clusters similar active listings into product groups, and
@@ -322,11 +333,15 @@ async function runTrendScan() {
       for (const [key, cluster] of Object.entries(clusters)) {
         if (cluster.items.length < MIN_CLUSTER_SIZE) continue;
 
-        const prices = cluster.items.map(i => i.price);
+        const goodConditionItems = cluster.items.filter(i => isGoodCondition(i.condition));
+        const pricePool = goodConditionItems.length > 0 ? goodConditionItems : cluster.items;
+        const prices = pricePool.map(i => i.price);
         const avgPrice = Math.round(prices.reduce((a, b) => a + b, 0) / prices.length);
         const minPrice = Math.round(Math.min(...prices));
         const maxPrice = Math.round(Math.max(...prices));
         const spreadPct = avgPrice > 0 ? ((maxPrice - minPrice) / avgPrice) * 100 : 0;
+        // Volume stays the full listing count (market depth), even though
+        // price bounds are restricted to good-condition listings.
         const volume = cluster.items.length;
         const flipScore = calcFlipScore(volume, spreadPct);
         const image = cluster.items.find(i => i.image)?.image || null;
@@ -399,6 +414,15 @@ async function runTrendScan() {
     const cutoff = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
     await supabaseQuery(`/scan_history?scanned_at=lt.${cutoff}`, 'DELETE');
 
+    // Also prune old daily_snapshots rows. /discover only ever reads the
+    // most recent date anyway, so older rows are just storage bloat at
+    // this point -- keep a couple weeks around in case /history is used
+    // later for an item's own price-over-time chart.
+    const snapshotCutoff = new Date(Date.now() - 14 * 24 * 60 * 60 * 1000)
+      .toISOString()
+      .split('T')[0];
+    await supabaseQuery(`/daily_snapshots?snapshot_date=lt.${snapshotCutoff}`, 'DELETE');
+
     lastScanTime = new Date();
     console.log(`Trend scan complete. Saved ${snapshotRows.length} unique items.`);
   } catch (err) {
@@ -430,9 +454,18 @@ app.get("/discover", async (req, res) => {
     );
 
     if (data && data.length > 0) {
+      // Only ever show results from the single most recent scan date.
+      // Cluster display names can shift slightly day to day (whichever
+      // listing has the shortest title that day "wins" the name), so an
+      // older row for what's logically the same product can sit under a
+      // different exact name and never get overwritten. Restricting to
+      // today's date keeps stale, pre-fix rows from polluting rankings.
+      const latestDate = data[0].snapshot_date;
+      const freshData = data.filter(item => item.snapshot_date === latestDate);
+
       const seen = new Set();
       const deduped = [];
-      for (const item of data) {
+      for (const item of freshData) {
         if (seen.has(item.name)) continue;
         seen.add(item.name);
         deduped.push(item);
@@ -453,7 +486,7 @@ app.get("/discover", async (req, res) => {
         flipScore: item.flip_score,
         source: 'discovered',
       }));
-      return res.json({ results: formatted, lastScanned: data[0]?.snapshot_date });
+      return res.json({ results: formatted, lastScanned: latestDate });
     }
 
     if (!scanInProgress && !lastScanTime) runTrendScan();
@@ -534,13 +567,6 @@ app.get("/trending", async (req, res) => {
 });
 
 // ─── Search endpoint ────────────────────────────────────────────────────────
-
-function isGoodCondition(conditionStr) {
-  if (!conditionStr) return true;
-  const c = conditionStr.toLowerCase();
-  const poorSignals = ['for parts', 'not working', 'damaged', 'as-is', 'as is', 'salvage'];
-  return !poorSignals.some(signal => c.includes(signal));
-}
 
 // Live eBay search for the /search bar. Pulls up to 100 real active
 // listings for the query, clusters them into sub-items, and returns each
