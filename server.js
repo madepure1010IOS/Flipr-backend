@@ -659,8 +659,17 @@ app.get("/history", async (req, res) => {
   }
 });
 
-// Manually trigger a rescan
+// Manually trigger a rescan -- ADMIN ONLY. Requires a secret key so this
+// can never be triggered by a regular user or anyone who finds the URL.
+// This is the only other path (besides the internal daily timer) that can
+// call RapidAPI, so it must not be publicly reachable.
+const ADMIN_SCAN_KEY = process.env.ADMIN_SCAN_KEY;
+
 app.post("/scan", async (req, res) => {
+  const providedKey = req.headers['x-admin-key'];
+  if (!ADMIN_SCAN_KEY || providedKey !== ADMIN_SCAN_KEY) {
+    return res.status(403).json({ error: 'Forbidden' });
+  }
   if (scanInProgress) {
     return res.json({ message: 'Scan already in progress' });
   }
