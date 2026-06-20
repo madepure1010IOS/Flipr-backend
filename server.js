@@ -716,44 +716,117 @@ app.get("/trending", async (req, res) => {
 });
 
 // Search endpoint
+// Maps eBay's condition strings to a simple good/poor bucket for filtering.
+// "Good condition" = anything genuinely usable/sellable. Excludes parts,
+// damaged, and non-working items that would skew prices down artificially.
+function isGoodCondition(conditionStr) {
+  if (!conditionStr) return true; // unknown condition -- don't exclude, just can't verify
+  const c = conditionStr.toLowerCase();
+  const poorSignals = ['for parts', 'not working', 'damaged', 'as-is', 'as is', 'salvage'];
+  return !poorSignals.some(signal => c.includes(signal));
+}
+
+// Live eBay search for the /search bar. Pulls up to 100 real active
+// listings for the query, clusters them into sub-items (reusing the same
+// clustering logic as the discovery scanner), and returns each cluster's
+// listing count + a condition-filtered price range. No RapidAPI, ever --
+// this is a fully live, user-triggered eBay-only endpoint.
+async function searchEbaySubItems(query, limit = 100) {
+  const token = await getEbayToken();
+  if (!token) return [];
+  try {
+    const encoded = encodeURIComponent(query);
+    const response = await fetch(
+      `https://api.ebay.com/buy/browse/v1/item_summary/search?q=${encoded}&limit=${limit}&filter=buyingOptions:{FIXED_PRICE}`,
+      {
+        headers: {
+          'Authorization': `Bearer ${token}`,
+          'Content-Type': 'application/json',
+          'X-EBAY-C-MARKETPLACE-ID': 'EBAY_US',
+        },
+      }
+    );
+    const data = await response.json();
+    if (!data.itemSummaries) return [];
+
+    const listings = data.itemSummaries
+      .filter(item => item.price && item.title)
+      .map(item => ({
+        title: item.title,
+        price: parseFloat(item.price.value),
+        image: item.image?.imageUrl || null,
+        condition: item.condition || null,
+      }));
+
+    const clusters = clusterListings(listings);
+    const subItems = [];
+
+    for (const [key, cluster] of Object.entries(clusters)) {
+      if (cluster.items.length < 1) continue;
+
+      const allPrices = cluster.items.map(i => i.price);
+      const goodConditionItems = cluster.items.filter(i => isGoodCondition(i.condition));
+      // If filtering leaves nothing (e.g. every listing is "for parts"),
+      // fall back to all items rather than showing an empty range
+      const pricePool = goodConditionItems.length > 0 ? goodConditionItems : cluster.items;
+      const pricePoolValues = pricePool.map(i => i.price);
+
+      const avgPrice = Math.round(
+        pricePoolValues.reduce((a, b) => a + b, 0) / pricePoolValues.length
+      );
+      const minPrice = Math.round(Math.min(...pricePoolValues));
+      const maxPrice = Math.round(Math.max(...pricePoolValues));
+
+      const displayName = cluster.items
+        .map(i => i.title)
+        .sort((a, b) => a.length - b.length)[0];
+      const image = cluster.items.find(i => i.image)?.image || null;
+
+      subItems.push({
+        name: displayName,
+        image,
+        activeListings: cluster.items.length,
+        avgPrice,
+        minPrice,
+        maxPrice,
+        category: getCategoryForItem(displayName),
+      });
+    }
+
+    // Largest clusters (most listings = most relevant sub-item) first
+    return subItems.sort((a, b) => b.activeListings - a.activeListings);
+  } catch (err) {
+    console.error('searchEbaySubItems error:', err.message);
+    return [];
+  }
+}
+
+// Search endpoint -- real eBay sub-items, no score, no fake variants.
+// Shows market depth (active listing count) and a condition-filtered
+// price range per sub-item. RapidAPI is never called here.
 app.get("/search", searchLimiter, async (req, res) => {
   const { q } = req.query;
   if (!q) return res.status(400).json({ error: "Query required" });
 
-  const ebayData = await searchEbay(q);
-  const mock = getMockListings(q);
-  const avgPrice = ebayData ? ebayData.avgPrice : mock.avgPrice;
-  const totalSold = ebayData ? ebayData.totalSold : mock.totalSold;
+  const subItems = await searchEbaySubItems(q, 100);
+
+  if (subItems.length === 0) {
+    return res.json({ query: q, results: [], source: 'ebay_live' });
+  }
 
   res.json({
-    source: ebayData ? 'ebay' : 'mock',
-    results: [
-      {
-        name: q,
-        ...mock,
-        avgPrice,
-        totalSold,
-        category: getCategoryForItem(q),
-        price: `$${avgPrice}`,
-        image: ebayData?.image || null,
-      },
-      {
-        name: `${q} (Used)`,
-        ...getMockListings(q),
-        avgPrice: Math.floor(avgPrice * 0.75),
-        category: getCategoryForItem(q),
-        price: `$${Math.floor(avgPrice * 0.75)}`,
-        image: ebayData?.image || null,
-      },
-      {
-        name: `${q} (New/Sealed)`,
-        ...getMockListings(q),
-        avgPrice: Math.floor(avgPrice * 1.15),
-        category: getCategoryForItem(q),
-        price: `$${Math.floor(avgPrice * 1.15)}`,
-        image: ebayData?.image || null,
-      },
-    ],
+    query: q,
+    results: subItems.map(item => ({
+      name: item.name,
+      image: item.image,
+      activeListings: item.activeListings,
+      avgPrice: item.avgPrice,
+      minPrice: item.minPrice,
+      maxPrice: item.maxPrice,
+      price: `$${item.avgPrice}`,
+      category: item.category,
+    })),
+    source: 'ebay_live',
   });
 });
 
