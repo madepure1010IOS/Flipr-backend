@@ -98,7 +98,7 @@ async function getEbayToken() {
   return null;
 }
 
-// ─── eBay keyword search (used by /pricehistory, /search) ───────────────────
+// ─── eBay keyword search (used by /pricehistory fallback, /trending, /item) ──
 
 async function searchEbay(query) {
   const token = await getEbayToken();
@@ -127,7 +127,9 @@ async function searchEbay(query) {
       avgPrice,
       minPrice: Math.round(Math.min(...prices)),
       maxPrice: Math.round(Math.max(...prices)),
-      totalSold: data.total || prices.length,
+      // eBay's total count of matching ACTIVE listings -- not sold items.
+      // The free Browse API only sees what's currently for sale.
+      totalListings: data.total || prices.length,
       image: imageItem?.image?.imageUrl || null,
     };
   } catch (err) {
@@ -192,9 +194,8 @@ const NOISE_WORDS = new Set([
   'ds', 'og', 'pair', 'edition', 'color', 'colorway',
 ]);
 
-// Common color words also get stripped — they vary listing to listing for
-// the "same" cluster intent (e.g. different colorways of the same model
-// often still represent the same flip opportunity at the product level)
+// Common color words also get stripped -- they vary listing to listing
+// for the "same" cluster intent.
 const COLOR_WORDS = new Set([
   'black', 'white', 'red', 'blue', 'green', 'yellow', 'grey', 'gray',
   'pink', 'purple', 'orange', 'brown', 'tan', 'beige', 'navy', 'gold',
@@ -210,12 +211,9 @@ function clusterKey(title) {
       w.length > 1 &&
       !NOISE_WORDS.has(w) &&
       !COLOR_WORDS.has(w) &&
-      isNaN(Number(w)) // drop pure numbers (sizes, years as standalone tokens)
+      isNaN(Number(w))
     );
 
-  // Keep only the first 4 significant words (brand + model usually lands
-  // here), then sort alphabetically so word order differences between
-  // listings of the same product still produce the same key
   return words.slice(0, 4).sort().join(' ').trim();
 }
 
@@ -230,88 +228,16 @@ function clusterListings(listings) {
   return clusters;
 }
 
-// ─── RapidAPI sold history ────────────────────────────────────────────────────
-
-async function getSoldPriceHistory(query) {
-  const rapidApiKey = process.env.RAPIDAPI_KEY;
-  if (!rapidApiKey) {
-    console.log('[rapidapi] No RAPIDAPI_KEY set');
-    return null;
-  }
-  try {
-    const response = await fetch(
-      'https://ebay-average-selling-price.p.rapidapi.com/findCompletedItems',
-      {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'x-rapidapi-host': 'ebay-average-selling-price.p.rapidapi.com',
-          'x-rapidapi-key': rapidApiKey,
-        },
-        body: JSON.stringify({
-          keywords: query,
-          max_search_results: '60',
-          remove_outliers: 'true',
-        }),
-      }
-    );
-
-    if (!response.ok) {
-      const errText = await response.text();
-      console.log(`[rapidapi] HTTP ${response.status} for "${query}": ${errText.slice(0, 300)}`);
-      return null;
-    }
-
-    const data = await response.json();
-    if (!data || !data.products || data.products.length === 0) {
-      console.log(`[rapidapi] No products for "${query}". Response:`, JSON.stringify(data).slice(0, 200));
-      return null;
-    }
-
-    const byMonth = {};
-    data.products.forEach(item => {
-      if (!item.sold_date || !item.sold_price) return;
-      const date = new Date(item.sold_date);
-      if (isNaN(date.getTime())) return;
-      const key = `${date.getFullYear()}-${String(date.getMonth()).padStart(2, '0')}`;
-      if (!byMonth[key]) byMonth[key] = { prices: [], date };
-      byMonth[key].prices.push(parseFloat(item.sold_price));
-    });
-
-    if (Object.keys(byMonth).length === 0) return null;
-
-    const monthNames = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
-    const sortedMonths = Object.entries(byMonth)
-      .sort(([a], [b]) => a.localeCompare(b))
-      .map(([key, val], i, arr) => ({
-        date: i === arr.length - 1 ? 'Now' : monthNames[val.date.getMonth()],
-        price: Math.round(val.prices.reduce((a, b) => a + b, 0) / val.prices.length),
-      }));
-
-    const oldest = sortedMonths[0]?.price || 0;
-    const newest = sortedMonths[sortedMonths.length - 1]?.price || 0;
-    const priceChangePct = oldest > 0 ? ((newest - oldest) / oldest) * 100 : 0;
-
-    return {
-      history6M: sortedMonths.slice(-6),
-      history1Y: sortedMonths.slice(-12),
-      avgPrice: Math.round(data.average_price) || null,
-      minPrice: Math.round(data.min_price) || null,
-      maxPrice: Math.round(data.max_price) || null,
-      totalSold: data.total_results || null,
-      priceChangePct: parseFloat(priceChangePct.toFixed(2)),
-      monthsOfData: sortedMonths.length,
-      source: 'rapidapi',
-    };
-  } catch (err) {
-    console.error(`[rapidapi] Exception for "${query}":`, err.message);
-    return null;
-  }
-}
-
 // ─── Discovery scanner ─────────────────────────────────────────────────────────
-// Sweeps real eBay categories, clusters similar listings into product groups,
-// and scores each cluster by flip potential. No hardcoded product names.
+// eBay-only -- no RapidAPI, no paid sold-history data. Sweeps real eBay
+// categories, clusters similar active listings into product groups, and
+// scores each cluster off two free signals:
+//   1. volume -- how many active listings exist for the same product
+//      (market depth / proven demand)
+//   2. spread -- how far apart the cheapest and priciest listing of that
+//      same product are, relative to the average (the flip itself: some
+//      seller is pricing well under what the item is actually going for
+//      elsewhere on the same results page)
 
 const CATEGORY_SWEEPS = [
   { id: '15709', name: 'Sneakers', keyword: 'shoes' },
@@ -346,47 +272,28 @@ const CATEGORY_SWEEPS = [
   { id: '11700', name: 'Garden', keyword: 'garden tool' },
 ];
 
-// Only deep-score this many categories per day, rotating through the full
-// list. Keeps RapidAPI usage flat (~5 categories x 8 items = ~40 calls/day)
-// no matter how many categories we sweep for clustering.
-const CATEGORIES_PER_DAY = 5;
-const CLUSTERS_PER_CATEGORY = 8;
+// Need at least this many listings in a cluster before the price spread
+// means anything -- two listings could just be a fluke price difference.
+const MIN_CLUSTER_SIZE = 3;
+// Keep only the best clusters per category so the table doesn't balloon.
+const CLUSTERS_PER_CATEGORY = 10;
 
-function getTodaysCategoryRotation() {
-  const dayIndex = Math.floor(Date.now() / (24 * 60 * 60 * 1000));
-  const totalSlots = Math.ceil(CATEGORY_SWEEPS.length / CATEGORIES_PER_DAY);
-  const slot = dayIndex % totalSlots;
-  const start = slot * CATEGORIES_PER_DAY;
-  return CATEGORY_SWEEPS.slice(start, start + CATEGORIES_PER_DAY);
-}
+function calcFlipScore(volume, spreadPct) {
+  // Volume score -- more active listings of the same product means a
+  // deeper, more liquid market to flip into. Caps around 40 listings.
+  const volumeScore = Math.min(volume / 40, 1) * 55;
 
-function calcFlipScore(soldVolume, priceChangePct, monthsOfData) {
-  // Volume score: more granular curve, caps out at higher volume so
-  // moderate-volume items don't all hit the ceiling identically
-  const volumeScore = Math.min(soldVolume / 60, 1) * 55;
+  // Spread score -- how far apart the cheapest and priciest listing of
+  // the same product are, relative to the average price. Capped at 80%
+  // so one wild outlier listing doesn't dominate the score.
+  const cappedSpread = Math.min(spreadPct, 80);
+  const spreadScore = (cappedSpread / 80) * 45;
 
-  let priceScore = 0;
-  if (priceChangePct >= -15 && priceChangePct < -1) {
-    // Real sweet spot — dipping but not crashing
-    priceScore = 40;
-  } else if (priceChangePct >= -1 && priceChangePct <= 1) {
-    // Effectively flat. If we only have one month of sold data, this isn't
-    // a real "stable price" signal -- it just means we can't measure trend
-    // yet. Score it low/neutral rather than rewarding it like a real dip.
-    priceScore = monthsOfData && monthsOfData <= 1 ? 12 : 22;
-  } else if (priceChangePct > 1 && priceChangePct <= 20) {
-    priceScore = 32 - priceChangePct; // rising — momentum, but less than a dip
-  } else if (priceChangePct < -15) {
-    priceScore = 5; // crashing — risky
-  } else {
-    priceScore = 8; // rising fast (>20%) — likely already peaked, lower signal
-  }
+  // Small deterministic variation so near-identical inputs don't all
+  // round to the exact same integer
+  const microVariance = volume % 7;
 
-  // Small deterministic variation based on volume so near-identical inputs
-  // don't all round to the exact same integer
-  const microVariance = (soldVolume % 7);
-
-  return Math.min(99, Math.round(volumeScore + priceScore + microVariance * 0.3));
+  return Math.min(99, Math.max(1, Math.round(volumeScore + spreadScore + microVariance * 0.3)));
 }
 
 let scanInProgress = false;
@@ -400,12 +307,9 @@ async function runTrendScan() {
   }
 
   scanInProgress = true;
-  console.log('Starting category discovery scan...');
-  const todaysScoring = getTodaysCategoryRotation();
-  const todaysScoringNames = new Set(todaysScoring.map(c => c.name));
-  console.log(`Today's deep-scoring rotation: ${todaysScoring.map(c => c.name).join(', ')}`);
+  console.log('Starting eBay-only discovery scan (no RapidAPI calls)...');
 
-  const discovered = [];
+  const results = [];
 
   for (const cat of CATEGORY_SWEEPS) {
     try {
@@ -413,42 +317,43 @@ async function runTrendScan() {
       if (listings.length === 0) continue;
 
       const clusters = clusterListings(listings);
-      const clusterSizes = Object.values(clusters).map(c => c.items.length).sort((a, b) => b - a);
-      console.log(`[cluster] ${cat.name}: ${listings.length} listings -> ${Object.keys(clusters).length} raw clusters, top sizes: ${clusterSizes.slice(0, 10).join(',')}`);
+      const scoredInCategory = [];
 
       for (const [key, cluster] of Object.entries(clusters)) {
-        // Only consider clusters with enough listings to mean something
-        if (cluster.items.length < 2) continue;
+        if (cluster.items.length < MIN_CLUSTER_SIZE) continue;
 
         const prices = cluster.items.map(i => i.price);
         const avgPrice = Math.round(prices.reduce((a, b) => a + b, 0) / prices.length);
+        const minPrice = Math.round(Math.min(...prices));
+        const maxPrice = Math.round(Math.max(...prices));
+        const spreadPct = avgPrice > 0 ? ((maxPrice - minPrice) / avgPrice) * 100 : 0;
+        const volume = cluster.items.length;
+        const flipScore = calcFlipScore(volume, spreadPct);
         const image = cluster.items.find(i => i.image)?.image || null;
-
-        // Use the cleanest/shortest title in the cluster as display name
         const displayName = cluster.items
           .map(i => i.title)
           .sort((a, b) => a.length - b.length)[0];
 
-        // Build a clean search query for RapidAPI from the cluster key itself
-        // (brand + model words, no seller fluff) -- much more likely to match
-        // real sold listings than the messy original eBay title
-        const searchQuery = key
-          .split(' ')
-          .filter(w => w.length > 2)
-          .slice(0, 4)
-          .join(' ');
-
-        discovered.push({
+        scoredInCategory.push({
           name: displayName,
-          searchQuery: searchQuery || displayName,
-          clusterKey: key,
           category: cat.name,
-          avgPrice,
-          clusterSize: cluster.items.length,
+          avg_price: avgPrice,
+          min_price: minPrice,
+          max_price: maxPrice,
+          // legacy column names, repurposed: sold_volume now means "active
+          // listing count", price_change_pct now means "price spread %"
+          sold_volume: volume,
+          price_change_pct: parseFloat(spreadPct.toFixed(2)),
+          flip_score: flipScore,
           image,
-          eligibleForScoring: todaysScoringNames.has(cat.name),
+          scanned_at: new Date().toISOString(),
         });
       }
+
+      scoredInCategory.sort((a, b) => b.flip_score - a.flip_score);
+      results.push(...scoredInCategory.slice(0, CLUSTERS_PER_CATEGORY));
+
+      console.log(`[scan] ${cat.name}: ${listings.length} listings -> ${Object.keys(clusters).length} clusters, kept ${Math.min(scoredInCategory.length, CLUSTERS_PER_CATEGORY)}`);
 
       await new Promise(r => setTimeout(r, 400));
     } catch (err) {
@@ -456,69 +361,7 @@ async function runTrendScan() {
     }
   }
 
-  console.log(`Found ${discovered.length} candidate clusters across ${CATEGORY_SWEEPS.length} categories. Deep-scoring only today's rotation: ${todaysScoring.map(c => c.name).join(', ')}.`);
-
-  // Only deep-score clusters from today's rotating category subset,
-  // taking the largest clusters per category up to CLUSTERS_PER_CATEGORY
-  const eligibleCandidates = discovered.filter(d => d.eligibleForScoring);
-  const byCategory = {};
-  for (const item of eligibleCandidates) {
-    if (!byCategory[item.category]) byCategory[item.category] = [];
-    byCategory[item.category].push(item);
-  }
-
-  const topCandidates = [];
-  for (const catName of Object.keys(byCategory)) {
-    const sorted = byCategory[catName].sort((a, b) => b.clusterSize - a.clusterSize);
-    topCandidates.push(...sorted.slice(0, CLUSTERS_PER_CATEGORY));
-  }
-
-  const results = [];
-  for (const item of topCandidates) {
-    try {
-      let soldData = await getSoldPriceHistory(item.searchQuery);
-
-      // If the specific cluster query found nothing, retry with a broader
-      // 2-word query (likely brand + general category) before giving up.
-      // Niche items often need a wider net to find any sold comps at all.
-      if (!soldData || !soldData.totalSold) {
-        const broaderQuery = item.searchQuery.split(' ').slice(0, 2).join(' ');
-        if (broaderQuery && broaderQuery !== item.searchQuery) {
-          await new Promise(r => setTimeout(r, 300));
-          soldData = await getSoldPriceHistory(broaderQuery);
-        }
-      }
-
-      if (!soldData || !soldData.totalSold) {
-        await new Promise(r => setTimeout(r, 300));
-        continue;
-      }
-
-      const soldVolume = soldData.totalSold;
-      const priceChangePct = soldData.priceChangePct ?? 0;
-      const flipScore = calcFlipScore(soldVolume, priceChangePct, soldData.monthsOfData);
-      const trend = priceChangePct >= -5 ? 'up' : 'down';
-      const avgPrice = soldData.avgPrice || item.avgPrice;
-
-      results.push({
-        name: item.name,
-        category: item.category,
-        avg_price: avgPrice,
-        sold_volume: soldVolume,
-        price_change_pct: priceChangePct,
-        flip_score: flipScore,
-        image: item.image,
-        trend,
-        scanned_at: new Date().toISOString(),
-      });
-
-      await new Promise(r => setTimeout(r, 300));
-    } catch (err) {
-      console.error(`Scoring error for ${item.name}:`, err.message);
-    }
-  }
-
-  console.log(`Scored ${results.length} of ${topCandidates.length} candidates with real sold data (rest skipped — no RapidAPI match).`);
+  console.log(`Scan complete: ${results.length} clusters scored across ${CATEGORY_SWEEPS.length} categories.`);
 
   if (results.length === 0) {
     console.log('No results to save.');
@@ -531,8 +374,6 @@ async function runTrendScan() {
     await supabaseQuery('/scan_history', 'POST', results);
 
     // Upsert today's best score per item into daily_snapshots.
-    // De-dupe by name first -- Postgres upsert errors if the same
-    // conflict key appears twice in one batch.
     const today = new Date().toISOString().split('T')[0];
     const seenNames = new Set();
     const snapshotRows = [];
@@ -543,11 +384,12 @@ async function runTrendScan() {
         name: r.name,
         category: r.category,
         avg_price: r.avg_price,
+        min_price: r.min_price,
+        max_price: r.max_price,
         sold_volume: r.sold_volume,
         price_change_pct: r.price_change_pct,
         flip_score: r.flip_score,
         image: r.image,
-        trend: r.trend,
         snapshot_date: today,
       });
     }
@@ -558,7 +400,7 @@ async function runTrendScan() {
     await supabaseQuery(`/scan_history?scanned_at=lt.${cutoff}`, 'DELETE');
 
     lastScanTime = new Date();
-    console.log(`Trend scan complete. ${results.length} items saved (scan_history + daily_snapshots).`);
+    console.log(`Trend scan complete. Saved ${snapshotRows.length} unique items.`);
   } catch (err) {
     console.error('Failed to save trends to Supabase:', err.message);
   }
@@ -566,42 +408,21 @@ async function runTrendScan() {
   scanInProgress = false;
 }
 
-// ─── Mock fallbacks ───────────────────────────────────────────────────────────
+// ─── Mock fallback (only hit if eBay itself returns nothing, e.g. no creds) ──
 
 const getMockListings = (query) => {
   const base = Math.floor(Math.random() * 200) + 100;
   return {
     query,
     avgPrice: base,
-    totalSold: Math.floor(Math.random() * 400) + 50,
-    avgDaysToSell: (Math.random() * 8 + 1).toFixed(1),
-    sellThroughRate: Math.floor(Math.random() * 40) + 50,
-    trend: base > 150 ? "up" : "down",
-    changePercent: (Math.random() * 20 + 1).toFixed(1),
+    totalListings: Math.floor(Math.random() * 400) + 50,
   };
 };
 
-function getMockHistory(base) {
-  const months = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Now'];
-  return {
-    history6M: months.map((date, i) => ({
-      date,
-      price: Math.floor(base * (0.78 + i * 0.04)),
-    })),
-    history1Y: months.map((date, i) => ({
-      date,
-      price: Math.floor(base * (0.65 + i * 0.07)),
-    })),
-    avgPrice: base,
-    source: 'mock',
-  };
-}
-
 // ─── Routes ───────────────────────────────────────────────────────────────────
 
-// Discover endpoint — returns ranked flip opportunities from the most
-// recent snapshot per item across the rotation (so categories not scored
-// today still show their last known score, not disappear)
+// Discover endpoint -- ranked flip opportunities, scored purely from live
+// eBay active-listing data (volume + price spread). No RapidAPI involved.
 app.get("/discover", async (req, res) => {
   try {
     const data = await supabaseQuery(
@@ -609,7 +430,6 @@ app.get("/discover", async (req, res) => {
     );
 
     if (data && data.length > 0) {
-      // De-dupe by name, keeping only the most recent snapshot per item
       const seen = new Set();
       const deduped = [];
       for (const item of data) {
@@ -624,9 +444,10 @@ app.get("/discover", async (req, res) => {
       const formatted = ranked.map(item => ({
         name: item.name,
         price: `$${item.avg_price}`,
-        change: `${item.price_change_pct >= 0 ? '+' : ''}${item.price_change_pct}%`,
-        trend: item.trend,
-        volume: `${item.sold_volume} sold`,
+        minPrice: item.min_price,
+        maxPrice: item.max_price,
+        spreadPct: item.price_change_pct,
+        volume: `${item.sold_volume} listed`,
         category: item.category,
         image: item.image,
         flipScore: item.flip_score,
@@ -659,10 +480,9 @@ app.get("/history", async (req, res) => {
   }
 });
 
-// Manually trigger a rescan -- ADMIN ONLY. Requires a secret key so this
-// can never be triggered by a regular user or anyone who finds the URL.
-// This is the only other path (besides the internal daily timer) that can
-// call RapidAPI, so it must not be publicly reachable.
+// Manually trigger a rescan -- ADMIN ONLY. No longer protecting against
+// per-call cost (eBay's Browse API is free), but still gated so it can't
+// be hammered by randoms who find the URL.
 const ADMIN_SCAN_KEY = process.env.ADMIN_SCAN_KEY;
 
 app.post("/scan", async (req, res) => {
@@ -682,7 +502,7 @@ app.get("/scan/status", (req, res) => {
   res.json({ scanInProgress, lastScanTime });
 });
 
-// Trending items endpoint (legacy — keeping for backwards compat)
+// Trending items endpoint (legacy -- keeping for backwards compat)
 app.get("/trending", async (req, res) => {
   const trendingNames = [
     "Nike Kobe 6 Protro",
@@ -699,13 +519,11 @@ app.get("/trending", async (req, res) => {
     const ebayData = await searchEbay(name);
     const mock = getMockListings(name);
     const avgPrice = ebayData ? ebayData.avgPrice : mock.avgPrice;
-    const totalSold = ebayData ? ebayData.totalSold : mock.totalSold;
+    const totalListings = ebayData ? ebayData.totalListings : mock.totalListings;
     return {
       name,
       price: `$${avgPrice}`,
-      change: `${mock.trend === "up" ? "+" : "-"}${mock.changePercent}%`,
-      trend: mock.trend,
-      volume: `${totalSold} listed`,
+      volume: `${totalListings} listed`,
       category: getCategoryForItem(name),
       image: ebayData?.image || null,
       source: ebayData ? 'ebay' : 'mock',
@@ -715,22 +533,18 @@ app.get("/trending", async (req, res) => {
   res.json(trending);
 });
 
-// Search endpoint
-// Maps eBay's condition strings to a simple good/poor bucket for filtering.
-// "Good condition" = anything genuinely usable/sellable. Excludes parts,
-// damaged, and non-working items that would skew prices down artificially.
+// ─── Search endpoint ────────────────────────────────────────────────────────
+
 function isGoodCondition(conditionStr) {
-  if (!conditionStr) return true; // unknown condition -- don't exclude, just can't verify
+  if (!conditionStr) return true;
   const c = conditionStr.toLowerCase();
   const poorSignals = ['for parts', 'not working', 'damaged', 'as-is', 'as is', 'salvage'];
   return !poorSignals.some(signal => c.includes(signal));
 }
 
 // Live eBay search for the /search bar. Pulls up to 100 real active
-// listings for the query, clusters them into sub-items (reusing the same
-// clustering logic as the discovery scanner), and returns each cluster's
-// listing count + a condition-filtered price range. No RapidAPI, ever --
-// this is a fully live, user-triggered eBay-only endpoint.
+// listings for the query, clusters them into sub-items, and returns each
+// cluster's listing count + a condition-filtered price range and spread.
 async function searchEbaySubItems(query, limit = 100) {
   const token = await getEbayToken();
   if (!token) return [];
@@ -764,10 +578,7 @@ async function searchEbaySubItems(query, limit = 100) {
     for (const [key, cluster] of Object.entries(clusters)) {
       if (cluster.items.length < 1) continue;
 
-      const allPrices = cluster.items.map(i => i.price);
       const goodConditionItems = cluster.items.filter(i => isGoodCondition(i.condition));
-      // If filtering leaves nothing (e.g. every listing is "for parts"),
-      // fall back to all items rather than showing an empty range
       const pricePool = goodConditionItems.length > 0 ? goodConditionItems : cluster.items;
       const pricePoolValues = pricePool.map(i => i.price);
 
@@ -776,6 +587,7 @@ async function searchEbaySubItems(query, limit = 100) {
       );
       const minPrice = Math.round(Math.min(...pricePoolValues));
       const maxPrice = Math.round(Math.max(...pricePoolValues));
+      const spreadPct = avgPrice > 0 ? ((maxPrice - minPrice) / avgPrice) * 100 : 0;
 
       const displayName = cluster.items
         .map(i => i.title)
@@ -789,11 +601,11 @@ async function searchEbaySubItems(query, limit = 100) {
         avgPrice,
         minPrice,
         maxPrice,
+        spreadPct: parseFloat(spreadPct.toFixed(2)),
         category: getCategoryForItem(displayName),
       });
     }
 
-    // Largest clusters (most listings = most relevant sub-item) first
     return subItems.sort((a, b) => b.activeListings - a.activeListings);
   } catch (err) {
     console.error('searchEbaySubItems error:', err.message);
@@ -801,9 +613,6 @@ async function searchEbaySubItems(query, limit = 100) {
   }
 }
 
-// Search endpoint -- real eBay sub-items, no score, no fake variants.
-// Shows market depth (active listing count) and a condition-filtered
-// price range per sub-item. RapidAPI is never called here.
 app.get("/search", searchLimiter, async (req, res) => {
   const { q } = req.query;
   if (!q) return res.status(400).json({ error: "Query required" });
@@ -823,6 +632,7 @@ app.get("/search", searchLimiter, async (req, res) => {
       avgPrice: item.avgPrice,
       minPrice: item.minPrice,
       maxPrice: item.maxPrice,
+      spreadPct: item.spreadPct,
       price: `$${item.avgPrice}`,
       category: item.category,
     })),
@@ -830,22 +640,17 @@ app.get("/search", searchLimiter, async (req, res) => {
   });
 });
 
-// Item detail endpoint
+// Item detail endpoint (legacy, mock-based -- kept for backwards compat)
 app.get("/item", (req, res) => {
   const { name } = req.query;
   if (!name) return res.status(400).json({ error: "Name required" });
   res.json(getMockListings(name));
 });
 
-// Price history endpoint
-// RULE: RapidAPI is NEVER called here or from any user-triggered request.
-// RapidAPI only runs inside the backend's own daily scan job.
-//
-// - If this item was found by the discovery scanner, serve its cached
-//   RapidAPI-sourced history + flip score straight from Supabase.
-// - If it's any other item (from general /search), build a price snapshot
-//   from live eBay Browse API data only -- current listings, no historical
-//   chart, no flip score, since that requires RapidAPI which we don't call here.
+// Price history / snapshot endpoint
+// RULE: no RapidAPI, ever. Everything here comes from either the cached
+// daily scan (Supabase) or a live eBay Browse API call. No historical
+// chart, no fake data.
 app.get("/pricehistory", async (req, res) => {
   const { name } = req.query;
   if (!name) return res.status(400).json({ error: "Name required" });
@@ -860,10 +665,11 @@ app.get("/pricehistory", async (req, res) => {
       const item = cached[0];
       return res.json({
         avgPrice: item.avg_price,
-        totalSold: item.sold_volume,
-        priceChangePct: item.price_change_pct,
+        minPrice: item.min_price,
+        maxPrice: item.max_price,
+        listingVolume: item.sold_volume,
+        spreadPct: item.price_change_pct,
         flipScore: item.flip_score,
-        trend: item.trend,
         scored: true,
         source: 'cached',
         lastUpdated: item.snapshot_date,
@@ -874,20 +680,23 @@ app.get("/pricehistory", async (req, res) => {
   }
 
   // 2. Not a discovered item -- build a live snapshot from eBay only.
-  // No RapidAPI call, no flip score, no historical chart.
   const ebayData = await searchEbay(name);
   if (ebayData) {
+    const spreadPct = ebayData.avgPrice > 0
+      ? ((ebayData.maxPrice - ebayData.minPrice) / ebayData.avgPrice) * 100
+      : 0;
     return res.json({
       avgPrice: ebayData.avgPrice,
       minPrice: ebayData.minPrice,
       maxPrice: ebayData.maxPrice,
-      totalSold: ebayData.totalSold,
+      listingVolume: ebayData.totalListings,
+      spreadPct: parseFloat(spreadPct.toFixed(2)),
       scored: false,
       source: 'ebay_live',
     });
   }
 
-  // 3. eBay also found nothing -- return an honest empty state, never mock data
+  // 3. eBay also found nothing -- honest empty state, never mock data
   return res.json({
     avgPrice: null,
     scored: false,
@@ -915,7 +724,7 @@ app.post('/ebay/account-deletion', (req, res) => {
 function getCategoryForItem(name) {
   if (name.includes("Nike") || name.includes("Jordan") || name.includes("Kobe") || name.includes("Adidas") || name.includes("New Balance") || name.includes("Asics")) return "Sneakers";
   if (name.includes("Pokemon") || name.includes("Pokémon") || name.includes("Funko") || name.includes("Magic") || name.includes("One Piece")) return "Collectibles";
-  if (name.includes("LEGO")) return "LEGO";
+  if (name.includes("LEGO")) return "Toys & Hobbies";
   if (name.includes("Supreme") || name.includes("Bape") || name.includes("Palace") || name.includes("Corteiz") || name.includes("Vintage")) return "Streetwear";
   if (name.includes("PS5") || name.includes("Nintendo") || name.includes("AirPods") || name.includes("iPad") || name.includes("GoPro") || name.includes("DJI")) return "Electronics";
   if (name.includes("Rolex") || name.includes("Casio") || name.includes("Seiko") || name.includes("Tissot")) return "Watches";
@@ -924,8 +733,8 @@ function getCategoryForItem(name) {
 }
 
 // Checks Supabase for the most recent real scan timestamp. Used on every
-// boot so redeploys never burn RapidAPI calls unless a scan is genuinely
-// overdue -- this decouples "server restarted" from "time to scan again".
+// boot so redeploys never trigger a fresh sweep unless one is genuinely
+// overdue -- decouples "server restarted" from "time to scan again".
 async function getLastRealScanTime() {
   if (!SUPABASE_URL || !SUPABASE_SECRET_KEY) return null;
   try {
@@ -957,7 +766,7 @@ async function scanIfOverdue() {
     runTrendScan();
   } else {
     const hoursLeft = ((SCAN_INTERVAL_MS - msSinceLastScan) / 3600000).toFixed(1);
-    console.log(`Last real scan was only ${(msSinceLastScan / 3600000).toFixed(1)}h ago -- skipping (next scan in ~${hoursLeft}h). Redeploys are free.`);
+    console.log(`Last real scan was only ${(msSinceLastScan / 3600000).toFixed(1)}h ago -- skipping (next scan in ~${hoursLeft}h).`);
   }
 }
 
@@ -967,11 +776,6 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Flipr backend running on http://localhost:${PORT}`);
 
-  // Check Supabase before scanning -- redeploys during development no
-  // longer cost RapidAPI calls unless a scan is genuinely overdue.
   setTimeout(() => scanIfOverdue(), 5000);
-
-  // Still check every 24h while the process stays alive, in case it runs
-  // continuously without a redeploy for multiple days.
   setInterval(() => scanIfOverdue(), 24 * 60 * 60 * 1000);
 });
